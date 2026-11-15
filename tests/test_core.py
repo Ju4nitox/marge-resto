@@ -92,3 +92,33 @@ def test_clean_flags_inconsistent_line():
                  "lines": [{"label": "A", "quantity": 2, "unit": "KG", "unit_price_ht": 5,
                             "line_total_ht": 14, "is_product": True}]})
     assert "≠" in out["lines"][0]["warning"]
+
+
+def test_ingredient_impact_observed(conn):
+    beurre = conn.execute("SELECT id FROM ingredients WHERE name = 'Beurre doux'").fetchone()[0]
+    imp = pricing.ingredient_impact(conn, beurre)
+    names = {d.dish for d in imp["dishes"]}
+    assert names == {"Entrecôte frites", "Pavé de saumon, crème citronnée", "Omelette, salade et frites"}
+    delta = 10.40 - (9.40 + 9.90) / 2
+    entrecote = next(d for d in imp["dishes"] if d.dish == "Entrecôte frites")
+    assert entrecote.extra_per_portion == pytest.approx(0.02 * delta)
+    assert entrecote.monthly_impact == pytest.approx(-0.02 * delta * 400)
+    assert entrecote.margin_rate_after < entrecote.margin_rate_before
+
+
+def test_ingredient_impact_simulated(conn):
+    boeuf = conn.execute("SELECT id FROM ingredients WHERE name = 'Bœuf haché 15 %'").fetchone()[0]
+    imp = pricing.ingredient_impact(conn, boeuf, simulated_change=0.10)
+    (burger,) = imp["dishes"]
+    assert burger.extra_per_portion == pytest.approx(0.18 * 13.20 * 0.10)
+    assert burger.monthly_impact == pytest.approx(-0.18 * 13.20 * 0.10 * 900)
+    # coût "avant" en simulation = coût actuel du plat
+    rep = pricing.dish_report(conn, conn.execute("SELECT id FROM dishes WHERE name='Burger maison'").fetchone()[0])
+    assert burger.cost_before == pytest.approx(rep.cost_now)
+
+
+def test_impact_ranking_sums_to_dish_drift(conn):
+    ranking = pricing.impact_ranking(conn)
+    total = sum(r["monthly_impact"] for r in ranking)
+    assert total == pytest.approx(sum(r.monthly_impact for r in pricing.all_dish_reports(conn)))
+    assert ranking[0]["monthly_impact"] <= ranking[-1]["monthly_impact"]

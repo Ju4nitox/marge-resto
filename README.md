@@ -30,7 +30,8 @@ Copie `.env.example` en `.env` et colle ta clé API Anthropic (console.anthropic
 | 2. Correspondance | Factures | Le lien « libellé fournisseur → ingrédient + conditionnement » est mémorisé : la facture suivante se remplit seule. |
 | 3. Prix | Prix des ingrédients | Prix ramené au kg, au litre ou à la pièce. Prix de référence = moyenne des achats des 90 jours précédents. |
 | 4. Fiches techniques | Plats et marges | Grammages nets, rendement, prix TTC, portions vendues par mois. |
-| 5. Alertes | Tableau de bord | Hausses au-dessus du seuil (5 % par défaut), plats dont la marge recule, € perdus par mois, prix conseillé. |
+| 5. Impact | Impact des hausses | Pour chaque matière première : marge perdue par mois sur tous les plats qui l'utilisent, part de la marge globale, simulation d'une hausse (ex. +10 % sur le bœuf). |
+| 6. Alertes | Tableau de bord | Hausses au-dessus du seuil (5 % par défaut), plats dont la marge recule, € perdus par mois, prix conseillé. |
 
 ## Structure
 

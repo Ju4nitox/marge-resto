@@ -157,3 +157,96 @@ def all_dish_reports(conn) -> list[DishReport]:
     statuses = {p.ingredient_id: p for p in all_price_status(conn)}
     ids = [r["id"] for r in conn.execute("SELECT id FROM dishes ORDER BY name")]
     return [dish_report(conn, i, statuses) for i in ids]
+
+
+# --- Impact d'un ingrédient sur la marge globale --------------------------------
+
+def monthly_margin(conn) -> float:
+    """Marge brute mensuelle de la carte (prix HT − coût matière actuel) × portions vendues."""
+    return sum((r.price_ht - r.cost_now) * r.monthly_volume for r in all_dish_reports(conn))
+
+
+@dataclass
+class DishImpact:
+    dish: str
+    price_ttc: float
+    vat_rate: float
+    price_ht: float
+    gross_qty: float          # quantité brute d'ingrédient par portion (avant rendement)
+    base_unit: str
+    monthly_volume: float
+    cost_before: float        # coût matière du plat avant la variation
+    extra_per_portion: float  # surcoût par portion dû à la variation
+
+    @property
+    def cost_after(self) -> float:
+        return self.cost_before + self.extra_per_portion
+
+    @property
+    def margin_rate_before(self) -> float:
+        return 1 - self.cost_before / self.price_ht if self.price_ht else 0.0
+
+    @property
+    def margin_rate_after(self) -> float:
+        return 1 - self.cost_after / self.price_ht if self.price_ht else 0.0
+
+    @property
+    def monthly_impact(self) -> float:
+        """Marge perdue (négatif) ou gagnée par mois."""
+        return -self.extra_per_portion * self.monthly_volume
+
+    @property
+    def price_ttc_to_keep_margin_eur(self) -> float:
+        return (self.price_ht + self.extra_per_portion) * (1 + self.vat_rate)
+
+
+def ingredient_impact(conn, ingredient_id: int, simulated_change: float | None = None) -> dict:
+    """Effet d'une variation de prix d'un ingrédient sur chaque plat qui l'utilise.
+
+    simulated_change=None : variation constatée (prix de référence -> dernier prix).
+    simulated_change=0.10 : hausse simulée de 10 % à partir du dernier prix.
+    """
+    st_ = price_status(conn, ingredient_id)
+    if st_.current is None:
+        return {"status": st_, "price_before": None, "price_after": None, "dishes": []}
+    if simulated_change is None:
+        before = st_.reference if st_.reference else st_.current
+        after = st_.current
+    else:
+        before = st_.current
+        after = st_.current * (1 + simulated_change)
+
+    statuses = {p.ingredient_id: p for p in all_price_status(conn)}
+    rows = conn.execute(
+        "SELECT d.id, d.name, d.price_ttc, d.vat_rate, d.monthly_volume, di.quantity, di.yield_pct "
+        "FROM dish_items di JOIN dishes d ON d.id = di.dish_id WHERE di.ingredient_id = ? ORDER BY d.name",
+        (ingredient_id,),
+    ).fetchall()
+    dishes = []
+    for r in rows:
+        rep = dish_report(conn, r["id"], statuses)
+        gross = r["quantity"] / (r["yield_pct"] or 1.0)
+        # coût "avant" = coût actuel du plat, avec cet ingrédient au prix "avant"
+        cost_before = rep.cost_now - gross * (st_.current - before)
+        dishes.append(DishImpact(r["name"], r["price_ttc"], r["vat_rate"], rep.price_ht, gross,
+                                 st_.base_unit, r["monthly_volume"], cost_before,
+                                 gross * (after - before)))
+    return {"status": st_, "price_before": before, "price_after": after, "dishes": dishes}
+
+
+def impact_ranking(conn) -> list[dict]:
+    """Tous les ingrédients utilisés dans la carte, classés par marge perdue par mois
+    du fait de leur variation de prix constatée."""
+    out = []
+    used = conn.execute("SELECT DISTINCT ingredient_id FROM dish_items").fetchall()
+    for row in used:
+        imp = ingredient_impact(conn, row["ingredient_id"])
+        st_ = imp["status"]
+        if st_.current is None:
+            continue
+        out.append({
+            "ingredient_id": st_.ingredient_id, "name": st_.name, "supplier": st_.supplier,
+            "change": st_.change, "dishes": len(imp["dishes"]),
+            "monthly_impact": sum(d.monthly_impact for d in imp["dishes"]),
+        })
+    return sorted(out, key=lambda x: x["monthly_impact"])

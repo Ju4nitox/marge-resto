@@ -97,6 +97,104 @@ def page_dashboard():
         st.success("Aucune hausse au-dessus du seuil d'alerte.")
 
 
+# --- Impact des hausses ---------------------------------------------------------
+
+def _bar(df: pd.DataFrame, label: str, value: str, title: str):
+    import altair as alt
+
+    chart = alt.Chart(df).mark_bar().encode(
+        x=alt.X(f"{value}:Q", title=title),
+        y=alt.Y(f"{label}:N", sort=alt.EncodingSortField(field=value, order="ascending"), title=None),
+        color=alt.condition(f"datum['{value}'] < 0", alt.value("#d1495b"), alt.value("#2e8b57")),
+        tooltip=[label, alt.Tooltip(f"{value}:Q", format=",.0f")],
+    ).properties(height=max(120, 34 * len(df)))
+    st.altair_chart(chart, width="stretch")
+
+
+def page_impact():
+    conn = get_conn()
+    st.title("Impact des hausses sur la marge")
+    total_margin = pricing.monthly_margin(conn)
+    ranking = pricing.impact_ranking(conn)
+    if not ranking:
+        st.info("Il faut des plats avec des fiches techniques et des prix d'achat. "
+                "Charge la démo dans **Paramètres** pour essayer.")
+        return
+
+    # 1. Vue d'ensemble : quelles matières premières coûtent le plus à la carte
+    st.subheader("Quelles hausses pèsent le plus")
+    st.caption("Marge perdue chaque mois sur l'ensemble des plats, du fait de la variation de prix constatée "
+               "de chaque ingrédient (dernier prix vs prix de référence), à volumes de vente constants.")
+    df = pd.DataFrame([{
+        "Ingrédient": r["name"], "Fournisseur": r["supplier"],
+        "Variation": r["change"] * 100 if r["change"] is not None else None,
+        "Plats concernés": r["dishes"], "Impact €/mois": round(r["monthly_impact"]),
+        "Part de la marge mensuelle": r["monthly_impact"] / total_margin * 100 if total_margin else None,
+    } for r in ranking])
+    moved = df[df["Impact €/mois"] != 0]
+    if not moved.empty:
+        _bar(moved, "Ingrédient", "Impact €/mois", "Marge gagnée (+) ou perdue (−) par mois, en €")
+    st.dataframe(df, hide_index=True, width="stretch", column_config={
+        "Variation": st.column_config.NumberColumn(format="%+.1f %%"),
+        "Impact €/mois": st.column_config.NumberColumn(format="%+d €"),
+        "Part de la marge mensuelle": st.column_config.NumberColumn(format="%+.2f %%"),
+    })
+    lost = sum(r["monthly_impact"] for r in ranking)
+    verb = "coûtent" if lost < 0 else "rapportent"
+    st.write(f"Au total, les variations de prix {verb} **{eur(abs(lost), 0)} de marge par mois** "
+             f"sur une marge brute mensuelle de {eur(total_margin, 0)} "
+             f"({pct(lost / total_margin, 2, sign=True) if total_margin else '—'}).")
+
+    # 2. Zoom sur un ingrédient
+    st.divider()
+    st.subheader("Zoom sur une matière première")
+    names = {r["name"]: r["ingredient_id"] for r in ranking}
+    c1, c2 = st.columns([2, 3])
+    pick = c1.selectbox("Ingrédient", list(names))  # le plus coûteux en premier
+    mode = c2.radio("Variation", ["Constatée sur les factures", "Simuler une variation"], horizontal=True)
+    sim = None
+    if mode == "Simuler une variation":
+        sim = st.slider("Variation simulée du prix (%)", -30, 50, 10, step=1) / 100
+
+    imp = pricing.ingredient_impact(conn, names[pick], sim)
+    s, dishes = imp["status"], imp["dishes"]
+    change = imp["price_after"] / imp["price_before"] - 1 if imp["price_before"] else 0.0
+    monthly = sum(d.monthly_impact for d in dishes)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Prix", f"{eur(imp['price_after'])} / {s.base_unit}", pct(change, sign=True), delta_color="inverse",
+              help=f"Avant : {eur(imp['price_before'])} / {s.base_unit}. Dernier fournisseur : {s.supplier}.")
+    k2.metric("Impact sur la marge / mois", ("+" if monthly > 0 else "") + eur(monthly, 0))
+    k3.metric("Impact sur la marge / an", ("+" if monthly > 0 else "") + eur(monthly * 12, 0))
+    k4.metric("Part de la marge mensuelle", pct(monthly / total_margin, 2, sign=True) if total_margin else "—")
+
+    if not dishes:
+        st.info("Cet ingrédient n'est utilisé dans aucun plat.")
+        return
+    ddf = pd.DataFrame([{
+        "Plat": d.dish,
+        "Quantité / portion": f"{d.gross_qty:.3f} {d.base_unit}".replace(".", ","),
+        "Surcoût / portion": d.extra_per_portion,
+        "Marge avant": d.margin_rate_before * 100, "Marge après": d.margin_rate_after * 100,
+        "Portions / mois": d.monthly_volume, "Impact €/mois": d.monthly_impact,
+        "Prix TTC pour garder la marge en €": d.price_ttc_to_keep_margin_eur, "Prix TTC actuel": d.price_ttc,
+    } for d in sorted(dishes, key=lambda d: d.monthly_impact)])
+    _bar(ddf.assign(**{"Impact €/mois": ddf["Impact €/mois"].round()}), "Plat", "Impact €/mois",
+         "Marge gagnée (+) ou perdue (−) par mois, en €")
+    st.dataframe(ddf, hide_index=True, width="stretch", column_config={
+        "Surcoût / portion": st.column_config.NumberColumn(format="%+.3f €"),
+        "Marge avant": st.column_config.NumberColumn(format="%.1f %%"),
+        "Marge après": st.column_config.NumberColumn(format="%.1f %%"),
+        "Portions / mois": st.column_config.NumberColumn(format="%d"),
+        "Impact €/mois": st.column_config.NumberColumn(format="%+.0f €"),
+        "Prix TTC pour garder la marge en €": st.column_config.NumberColumn(format="%.2f €"),
+        "Prix TTC actuel": st.column_config.NumberColumn(format="%.2f €"),
+    })
+    if any(d.monthly_volume == 0 for d in dishes):
+        st.caption("Les plats sans portions vendues renseignées comptent pour 0 € : "
+                   "complète-les dans **Plats et marges**.")
+
+
 # --- Factures -----------------------------------------------------------------
 
 def _prefill_lines(conn, supplier: str, raw_lines: list[dict]) -> pd.DataFrame:
@@ -429,6 +527,7 @@ def main():
     st.set_page_config(page_title="Marge Resto", page_icon="🍽️", layout="wide")
     nav = st.navigation([
         st.Page(page_dashboard, title="Tableau de bord", url_path="tableau", default=True),
+        st.Page(page_impact, title="Impact des hausses", url_path="impact"),
         st.Page(page_invoices, title="Factures", url_path="factures"),
         st.Page(page_ingredients, title="Prix des ingrédients", url_path="prix"),
         st.Page(page_dishes, title="Plats et marges", url_path="plats"),
