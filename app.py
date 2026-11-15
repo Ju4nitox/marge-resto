@@ -53,18 +53,93 @@ def qty(q: float, unit: str) -> str:
     if unit == "L" and q < 1:
         return f"{q * 100:.0f} cl"
     if unit == "pièce":
-        return f"{q:g} pièce" + ("s" if q > 1 else "")
-    return f"{q:.2f} {unit}".replace(".", ",")
+        return f"{q:,.0f} pièce".replace(",", " ") + ("s" if q > 1 else "")
+    if q >= 10:
+        return f"{q:,.0f} {unit}".replace(",", " ")
+    return f"{q:.1f} {unit}".replace(".", ",")
 
 
 CSS = """
 <style>
-.block-container {max-width: 1100px; padding-top: 2rem;}
-.big {font-size: 2.1rem; font-weight: 700; line-height: 1.1;}
-.red {color: #c0392b;} .green {color: #1e8449;} .muted {color: #888; font-size: .9rem;}
-.lead {font-size: 1.15rem; margin: .2rem 0 1.2rem 0;}
+/* Polices : déclarées dans .streamlit/config.toml (servies depuis static/fonts, licence OFL) */
+
+:root {
+  --bouteille: #1F4D3A;   /* banquettes */
+  --bouteille-2: #2A5E49;
+  --laiton: #D9B44A;      /* comptoir */
+  --carrelage: #FAFBF7;
+  --encre: #1C2421;
+  --tomate: #C8432F;      /* pertes */
+  --herbe: #2D7A55;       /* gains */
+  --sauge: #6B7A72;
+  --filet: #DCE5DD;
+}
+h1, h2, h3, h4 { letter-spacing: -0.02em; color: var(--encre); }
+h1 { font-weight: 800 !important; font-size: 2.3rem !important; padding-bottom: .4rem !important; }
+h3 { font-weight: 700 !important; font-size: 1.25rem !important; margin-top: 1.6rem !important; }
+.block-container { max-width: 1040px; padding-top: 2.4rem; padding-bottom: 4rem; }
+
+/* L'ardoise : le chiffre clé de chaque page, sur fond vert bouteille carrelé */
+.slate {
+  position: relative; overflow: hidden;
+  background-color: var(--bouteille);
+  background-image:
+    linear-gradient(rgba(255,255,255,.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,.045) 1px, transparent 1px);
+  background-size: 26px 13px;   /* carreaux métro */
+  color: #F3F6F1; border-radius: 16px; padding: 1.7rem 2rem 1.6rem;
+  border-top: 5px solid var(--laiton); margin: .4rem 0 1.4rem;
+}
+.slate-label { font-size: 1.02rem; opacity: .86; max-width: 40ch; }
+.slate-number {
+  font-family: 'Bricolage Grotesque', sans-serif; font-weight: 800;
+  font-size: clamp(2.6rem, 7vw, 4.2rem); line-height: 1; letter-spacing: -0.03em;
+  margin: .45rem 0 .5rem; font-variant-numeric: tabular-nums;
+}
+.slate.loss .slate-number { color: #FFB4A3; }
+.slate.gain .slate-number { color: var(--laiton); }
+.slate-sub { font-size: .95rem; opacity: .78; max-width: 62ch; }
+
+/* Cartes : blanches, filet sauge, pas d'ombre */
+[data-testid="stVerticalBlockBorderWrapper"]:has(> div > [data-testid="stVerticalBlock"]) {
+  background: #FFFFFF;
+}
+div[data-testid="stVerticalBlockBorderWrapper"] { border-color: var(--filet) !important; }
+
+/* Chiffres */
+[data-testid="stMetricValue"] { font-family: 'Bricolage Grotesque', sans-serif; font-weight: 700; font-variant-numeric: tabular-nums; }
+[data-testid="stMetricLabel"] p { color: var(--sauge); font-weight: 600; }
+.num { font-variant-numeric: tabular-nums; }
+.red { color: var(--tomate); } .green { color: var(--herbe); } .brass { color: #9A7618; }
+.muted { color: var(--sauge); font-size: .9rem; }
+.big { font-family: 'Bricolage Grotesque', sans-serif; font-size: 1.7rem; font-weight: 800; line-height: 1.1; }
+.pill { display: inline-block; padding: .08rem .55rem; border-radius: 999px; font-weight: 700; font-size: .9rem; }
+.pill.loss { background: #FBE6E1; color: var(--tomate); }
+.pill.gain { background: #E2F0E7; color: var(--herbe); }
+
+/* Boutons */
+.stButton > button[kind="primary"], .stFormSubmitButton > button { background: var(--bouteille); border-color: var(--bouteille); }
+.stButton > button[kind="primary"]:hover { background: var(--bouteille-2); border-color: var(--bouteille-2); }
+.stButton > button:focus-visible { outline: 3px solid var(--laiton); outline-offset: 2px; }
+
+/* Barre latérale */
+[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2 { color: #F3F6F1; }
+[data-testid="stSidebarNav"] a span { font-weight: 600; }
+
+@media (max-width: 640px) {
+  .slate { padding: 1.3rem 1.2rem 1.2rem; }
+  h1 { font-size: 1.8rem !important; }
+}
 </style>
 """
+
+
+def slate(label: str, number: str, sub: str = "", tone: str = "loss") -> None:
+    """Affiche le chiffre clé d'une page sur l'« ardoise » vert bouteille."""
+    st.markdown(f"<div class='slate {tone}'><div class='slate-label'>{label}</div>"
+                f"<div class='slate-number'>{number}</div>"
+                + (f"<div class='slate-sub'>{sub}</div>" if sub else "") + "</div>",
+                unsafe_allow_html=True)
 
 
 @st.cache_resource
@@ -102,15 +177,16 @@ def page_home():
     reports = [r for r in pricing.all_dish_reports(conn) if r.cost_now > 0]
     hit = [r for r in reports if r.margin_drift_pts < -0.05]
 
-    color = "red" if lost < 0 else "green"
-    st.markdown(f"<div class='lead'>Les hausses fournisseurs te coûtent "
-                f"<span class='big {color}'>{eur(abs(lost), 0)}</span> de marge par mois</div>",
-                unsafe_allow_html=True)
+    if lost < 0:
+        slate("Ce que les hausses de tes fournisseurs te coûtent chaque mois", eur(-lost, 0),
+              f"Soit {eur(-lost * 12, 0)} sur un an, par rapport aux prix des 90 derniers jours.")
+    else:
+        slate("Les variations de prix te font gagner chaque mois", eur(lost, 0), tone="gain")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Sur un an", eur(lost * 12, 0))
-    c2.metric("Produits en hausse", n_alerts,
+    c1.metric("Produits en hausse", n_alerts,
               help=f"Hausse d'au moins {pct(db.get_setting(conn, 'alert_threshold'), 0)} (réglable dans Paramètres).")
-    c3.metric("Plats touchés", f"{len(hit)} / {len(reports)}")
+    c2.metric("Plats touchés", f"{len(hit)} sur {len(reports)}")
+    c3.metric("Marge brute par mois", eur(total_margin, 0))
 
     st.subheader("Les hausses qui te coûtent le plus")
     if not hikes:
@@ -118,10 +194,11 @@ def page_home():
     for r in hikes[:3]:
         with st.container(border=True):
             a, b, c = st.columns([3, 2, 1], vertical_alignment="center")
-            a.markdown(f"**{r['name']}**  \n<span class='muted'>{r['supplier']} · "
+            a.markdown(f"**{r['name']}**  \n<span class='muted'>chez {r['supplier']}, dans "
                        f"{r['dishes']} plat{'s' if r['dishes'] > 1 else ''}</span>", unsafe_allow_html=True)
-            b.markdown(f"<span class='red'><b>{pct(r['change'], sign=True)}</b> · "
-                       f"{eur(r['monthly_impact'], 0)} / mois</span>", unsafe_allow_html=True)
+            b.markdown(f"<span class='pill loss'>{pct(r['change'], sign=True)}</span> "
+                       f"<span class='red num'><b>{eur(r['monthly_impact'], 0)}</b> par mois</span>",
+                       unsafe_allow_html=True)
             c.button("Voir", key=f"see_{r['ingredient_id']}", on_click=go_product,
                      args=(r["ingredient_id"],), width="stretch")
 
@@ -141,13 +218,12 @@ def page_home():
     if saving > 0.5:
         with st.container(border=True):
             a, b = st.columns([5, 1], vertical_alignment="center")
-            a.markdown(f"💡 En changeant de fournisseur sur certains produits, tu économiserais "
-                       f"**{eur(saving, 0)} par mois**.")
+            a.markdown(f"En changeant de fournisseur sur certains produits, tu économiserais "
+                       f"<span class='brass'><b>{eur(saving, 0)} par mois</b></span>.", unsafe_allow_html=True)
             if b.button("Comparer", width="stretch"):
                 st.switch_page(PAGES["fournisseurs"])
 
-    st.caption(f"Marge brute mensuelle de la carte : {eur(total_margin, 0)}. "
-               "Calculs à volumes de vente constants, par rapport aux prix des 90 derniers jours.")
+    st.caption("Calculs à volumes de vente constants.")
 
 
 # --- Par produit ---------------------------------------------------------------
@@ -180,14 +256,14 @@ def page_product():
     monthly = sum(d.monthly_impact for d in dishes)
     unit = s.base_unit
 
-    # En-tête : 3 chiffres
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Prix d'achat" + (" simulé" if sim is not None else ""), f"{eur(after)} / {unit}",
-              pct(change, sign=True), delta_color="inverse")
-    c2.metric("Impact sur ta marge", f"{eur(monthly, 0, sign=True)} / mois")
-    c3.metric("Sur un an", eur(monthly * 12, 0, sign=True))
-    st.caption(f"Avant : {eur(before)} / {unit}"
-               + ("" if sim is not None else f" (moyenne des 90 jours précédents) · dernier achat chez {s.supplier}"))
+    verb = "passerait" if sim is not None else "est passé"
+    tone = "loss" if monthly < 0 else "gain"
+    slate(f"{s.name} : le prix {verb} de {eur(before)} à {eur(after)} le {unit} ({pct(change, sign=True)}). "
+          f"Effet sur ta marge chaque mois :",
+          eur(monthly, 0, sign=True),
+          f"Soit {eur(monthly * 12, 0, sign=True)} sur un an."
+          + ("" if sim is not None else f" Dernier achat chez {s.supplier}, comparé à la moyenne des 90 jours précédents."),
+          tone)
 
     if not dishes:
         st.info("Ce produit n'entre dans aucun plat de la carte.")
@@ -198,10 +274,10 @@ def page_product():
     for d in sorted(dishes, key=lambda d: d.monthly_impact):
         with st.container(border=True):
             a, b, c = st.columns([3, 2, 3], vertical_alignment="center")
-            a.markdown(f"**{d.dish}**  \n<span class='muted'>{qty(d.gross_qty, unit)} par assiette · "
-                       f"{d.monthly_volume:.0f} vendus / mois</span>", unsafe_allow_html=True)
+            a.markdown(f"**{d.dish}**  \n<span class='muted'>{qty(d.gross_qty, unit)} par assiette, "
+                       f"{d.monthly_volume:.0f} vendus par mois</span>", unsafe_allow_html=True)
             cls = "red" if d.monthly_impact < 0 else "green"
-            b.markdown(f"<span class='{cls}'><b>{eur(d.monthly_impact, 0, sign=True)} / mois</b></span>  \n"
+            b.markdown(f"<span class='{cls} num'><b>{eur(d.monthly_impact, 0, sign=True)}</b> par mois</span>  \n"
                        f"<span class='muted'>marge {pct(d.margin_rate_before)} → {pct(d.margin_rate_after)}</span>",
                        unsafe_allow_html=True)
             if abs(d.extra_per_portion) >= 0.005:
@@ -216,7 +292,7 @@ def page_product():
         for o in cmp_.offers:
             best = o is cmp_.best and cmp_.has_alternative
             st.markdown(("🏆 " if best else "• ") + _offer_line(o, unit, cmp_, current=o.supplier == cmp_.current.supplier)
-                        + (" · <span class='muted'>fournisseur actuel</span>" if o.supplier == cmp_.current.supplier else ""),
+                        + (" <span class='muted'>(ton fournisseur actuel)</span>" if o.supplier == cmp_.current.supplier else ""),
                         unsafe_allow_html=True)
         if cmp_.monthly_saving > 0.5:
             st.success(f"Passer chez {cmp_.best.supplier} : {eur(cmp_.monthly_saving, 0)} d'économie par mois.")
@@ -236,8 +312,8 @@ def page_product():
 def _offer_line(o, unit: str, cmp_, current: bool = False) -> str:
     when = date.fromisoformat(o.date).strftime("%d/%m")
     tag = f"{'facture' if o.source == 'facture' else 'devis'} du {when}"
-    stale = " · <span class='red'>à confirmer</span>" if cmp_.is_stale(o) and not current else ""
-    return f"**{o.supplier}** · {eur(o.price)}/{unit} <span class='muted'>({tag})</span>{stale}"
+    stale = " <span class='pill loss'>à confirmer</span>" if cmp_.is_stale(o) and not current else ""
+    return f"**{o.supplier}**, {eur(o.price)} le {unit} <span class='muted'>({tag})</span>{stale}"
 
 
 def page_suppliers():
@@ -250,9 +326,10 @@ def page_suppliers():
     deals = [c for c in comps if c.monthly_saving > 0.5]
     total = sum(c.monthly_saving for c in deals)
     if deals:
-        st.markdown(f"<div class='lead'>En changeant de fournisseur sur {len(deals)} produit"
-                    f"{'s' if len(deals) > 1 else ''}, tu économiserais "
-                    f"<span class='big green'>{eur(total, 0)}</span> par mois</div>", unsafe_allow_html=True)
+        slate(f"En changeant de fournisseur sur {len(deals)} produit{'s' if len(deals) > 1 else ''}, "
+              "tu économiserais chaque mois", eur(total, 0),
+              f"Soit {eur(total * 12, 0)} sur un an, d'après les quantités que tu as achetées ces 90 derniers jours.",
+              "gain")
     else:
         st.success("Tu achètes déjà chaque produit au meilleur prix connu.")
 
@@ -264,15 +341,16 @@ def page_suppliers():
             a.markdown("Aujourd'hui : " + _offer_line(c.current, u, c, current=True), unsafe_allow_html=True)
             a.markdown(f"Moins cher ({pct(c.best.price / c.current.price - 1, sign=True)}) : "
                        + _offer_line(c.best, u, c), unsafe_allow_html=True)
-            b.markdown(f"<span class='big green'>{eur(c.monthly_saving, 0)}</span><br>"
-                       f"<span class='muted'>par mois · {qty(c.monthly_qty, u)} achetés / mois</span>",
+            b.markdown(f"<span class='big brass'>{eur(c.monthly_saving, 0)}</span><br>"
+                       f"<span class='muted'>d'économie par mois, sur {qty(c.monthly_qty, u)} achetés</span>",
                        unsafe_allow_html=True)
             b.button("Voir le produit", key=f"cmp_{c.ingredient_id}", on_click=go_product,
                      args=(c.ingredient_id,))
 
     to_check = [c for c in comps if c.stale_cheaper]
     if to_check:
-        st.markdown("**À redemander** — prix moins chers mais vieux de plus de 2 mois :")
+        st.subheader("À redemander")
+        st.caption("Ces prix sont moins chers mais datent de plus de 2 mois : demande un prix à jour.")
         for c in to_check:
             o = c.stale_cheaper[0]
             st.markdown(f"• {c.name} : " + _offer_line(o, c.base_unit, c)
@@ -391,7 +469,7 @@ def page_invoices():
                 with st.container(border=True):
                     a, b, c = st.columns([2, 3, 2], vertical_alignment="center")
                     a.write(date.fromisoformat(r["invoice_date"]).strftime("%d/%m/%Y"))
-                    b.write(f"**{r['supplier']}** · n° {r['invoice_number']}")
+                    b.write(f"**{r['supplier']}**, facture n° {r['invoice_number']}")
                     c.write(eur(r["total_ht"]) + " HT" if r["total_ht"] else "")
         return
 
@@ -410,7 +488,7 @@ def page_invoices():
     ings = ingredients(conn)
     df = _prefill_lines(conn, supplier, draft["lines"])
     a, b = st.columns([4, 1], vertical_alignment="bottom")
-    a.caption("✅ déjà connu · 🟡 à vérifier · 🔴 choisis le produit · ⚪ ignoré · ⚠ montant incohérent.  \n"
+    a.caption("✅ déjà connu, 🟡 à vérifier, 🔴 choisis le produit, ⚪ ignoré, ⚠ montant incohérent.  \n"
               "« kg/L/pièces par unité » : ce que contient une unité facturée (colis 6 × 1 L → 6).")
     with b:
         _new_ingredient_form(conn, "inv")
@@ -487,8 +565,8 @@ def page_menu():
         for r in sorted(reports, key=lambda r: r.margin_rate_now):
             with st.container(border=True):
                 a, b, c, d = st.columns([3, 1, 2, 1], vertical_alignment="center")
-                a.markdown(f"**{r.name}**  \n<span class='muted'>{eur(r.price_ttc)} TTC · "
-                           f"{dishes[r.dish_id]['monthly_volume']:.0f} / mois</span>", unsafe_allow_html=True)
+                a.markdown(f"**{r.name}**  \n<span class='muted'>{eur(r.price_ttc)} TTC, "
+                           f"{dishes[r.dish_id]['monthly_volume']:.0f} vendus par mois</span>", unsafe_allow_html=True)
                 cls = "red" if r.food_cost_now > target else ""
                 b.markdown(f"<span class='{cls}'><b>{pct(r.margin_rate_now, 0)}</b></span>  \n"
                            f"<span class='muted'>de marge</span>", unsafe_allow_html=True)
@@ -618,6 +696,7 @@ def main():
     load_env()
     st.set_page_config(page_title="Marge Resto", page_icon="🍽️", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
+    st.logo(str(ROOT / "assets" / "logo.svg"), size="large", icon_image=str(ROOT / "assets" / "logo-icon.svg"))
     PAGES.update({
         "accueil": st.Page(page_home, title="Accueil", icon="🏠", url_path="accueil", default=True),
         "produit": st.Page(page_product, title="Par produit", icon="🔎", url_path="produit"),

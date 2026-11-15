@@ -1,0 +1,59 @@
+[theme]
+base = "light"
+primaryColor = "#1F4D3A"            # vert bouteille (banquettes de brasserie)
+backgroundColor = "#FAFBF7"         # blanc carrelage
+secondaryBackgroundColor = "#EEF3EE"
+textColor = "#1C2421"
+borderColor = "#DCE5DD"
+font = "Manrope"
+headingFont = "Bricolage Grotesque"
+baseRadius = "10px"
+showWidgetBorder = true
+
+[[theme.fontFaces]]
+family = "Manrope"
+url = "app/static/fonts/manrope-latin-400-normal.woff2"
+weight = 400
+
+[[theme.fontFaces]]
+family = "Manrope"
+url = "app/static/fonts/manrope-latin-500-normal.woff2"
+weight = 500
+
+[[theme.fontFaces]]
+family = "Manrope"
+url = "app/static/fonts/manrope-latin-600-normal.woff2"
+weight = 600
+
+[[theme.fontFaces]]
+family = "Manrope"
+url = "app/static/fonts/manrope-latin-700-normal.woff2"
+weight = 700
+
+[[theme.fontFaces]]
+family = "Bricolage Grotesque"
+url = "app/static/fonts/bricolage-grotesque-latin-500-normal.woff2"
+weight = 500
+
+[[theme.fontFaces]]
+family = "Bricolage Grotesque"
+url = "app/static/fonts/bricolage-grotesque-latin-700-normal.woff2"
+weight = 700
+
+[[theme.fontFaces]]
+family = "Bricolage Grotesque"
+url = "app/static/fonts/bricolage-grotesque-latin-800-normal.woff2"
+weight = 800
+
+[theme.sidebar]
+backgroundColor = "#1F4D3A"
+secondaryBackgroundColor = "#2A5E49"
+textColor = "#EEF3EC"
+primaryColor = "#D9B44A"
+borderColor = "#2F6650"
+
+[client]
+toolbarMode = "minimal"
+
+[server]
+enableStaticServing = true

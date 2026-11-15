@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="220" height="48" viewBox="0 0 220 48">
+  <!-- assiette en laiton -->
+  <circle cx="24" cy="24" r="19" fill="none" stroke="#D9B44A" stroke-width="3"/>
+  <circle cx="24" cy="24" r="11" fill="none" stroke="#D9B44A" stroke-width="1.5" opacity=".7"/>
+  <!-- flèche de marge qui remonte -->
+  <path d="M16 29 L22 23 L26 26 L32 19" fill="none" stroke="#F3F6F1" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="54" y="31" font-family="'Bricolage Grotesque', 'Helvetica Neue', Arial, sans-serif" font-size="22" font-weight="800" fill="#F3F6F1" letter-spacing="-0.5">Marge Resto</text>
+</svg>
