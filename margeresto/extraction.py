@@ -8,6 +8,7 @@ from pathlib import Path
 DEFAULT_MODEL = os.environ.get("MARGE_MODEL", "claude-sonnet-5-5")
 
 MEDIA_TYPES = {
+    ".xml": "application/xml",
     ".pdf": "application/pdf",
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -132,3 +133,25 @@ def clean(raw: dict) -> dict:
         "total_ht": raw.get("total_ht"),
         "lines": lines,
     }
+
+
+def read_invoice(file_bytes: bytes, filename: str, model: str = DEFAULT_MODEL) -> dict:
+    """Point d'entrée unique : Factur-X d'abord (gratuit, exact), sinon lecture par IA.
+
+    Ajoute "method" : "facturx" ou "ia".
+    """
+    from .facturx import FacturXError, find_xml_in_pdf, parse_cii
+
+    ext = Path(filename).suffix.lower()
+    xml = file_bytes if ext == ".xml" else (find_xml_in_pdf(file_bytes) if ext == ".pdf" else None)
+    if xml is not None:
+        try:
+            out = clean(parse_cii(xml))
+            out["method"] = "facturx"
+            return out
+        except FacturXError as e:
+            if ext == ".xml":
+                raise ExtractionError(str(e)) from e
+    out = extract_invoice(file_bytes, filename, model)
+    out["method"] = "ia"
+    return out

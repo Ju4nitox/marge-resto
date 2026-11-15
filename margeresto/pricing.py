@@ -177,6 +177,9 @@ class DishImpact:
     monthly_volume: float
     cost_before: float        # coût matière du plat avant la variation
     extra_per_portion: float  # surcoût par portion dû à la variation
+    dish_id: int | None = None
+    net_qty: float = 0.0      # quantité nette dans l'assiette (fiche technique)
+    yield_pct: float = 1.0
 
     @property
     def cost_after(self) -> float:
@@ -200,7 +203,8 @@ class DishImpact:
         return (self.price_ht + self.extra_per_portion) * (1 + self.vat_rate)
 
 
-def ingredient_impact(conn, ingredient_id: int, simulated_change: float | None = None) -> dict:
+def ingredient_impact(conn, ingredient_id: int, simulated_change: float | None = None,
+                      price_before: float | None = None) -> dict:
     """Effet d'une variation de prix d'un ingrédient sur chaque plat qui l'utilise.
 
     simulated_change=None : variation constatée (prix de référence -> dernier prix).
@@ -210,7 +214,7 @@ def ingredient_impact(conn, ingredient_id: int, simulated_change: float | None =
     if st_.current is None:
         return {"status": st_, "price_before": None, "price_after": None, "dishes": []}
     if simulated_change is None:
-        before = st_.reference if st_.reference else st_.current
+        before = price_before if price_before is not None else (st_.reference or st_.current)
         after = st_.current
     else:
         before = st_.current
@@ -230,7 +234,7 @@ def ingredient_impact(conn, ingredient_id: int, simulated_change: float | None =
         cost_before = rep.cost_now - gross * (st_.current - before)
         dishes.append(DishImpact(r["name"], r["price_ttc"], r["vat_rate"], rep.price_ht, gross,
                                  st_.base_unit, r["monthly_volume"], cost_before,
-                                 gross * (after - before)))
+                                 gross * (after - before), r["id"], r["quantity"], r["yield_pct"] or 1.0))
     return {"status": st_, "price_before": before, "price_after": after, "dishes": dishes}
 
 

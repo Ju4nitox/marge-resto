@@ -1,5 +1,9 @@
 """Marge Resto — prototype Streamlit.
 
+Le problème : les prix fournisseurs montent par petites touches, les prix de la carte
+ne bougent pas, et la marge fond sans qu'on le voie. L'app détecte chaque hausse dès
+la facture, la chiffre sur tous les plats concernés, et propose quoi faire.
+
 Lancer :  streamlit run app.py
 """
 from __future__ import annotations
@@ -7,17 +11,19 @@ from __future__ import annotations
 import os
 from datetime import date
 from pathlib import Path
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
 
-from margeresto import db, demo, pricing, suppliers
-from margeresto.extraction import ExtractionError, api_key_available, extract_invoice
+from margeresto import actions, credits, db, demo, notify, pricing, suppliers
+from margeresto.extraction import ExtractionError, api_key_available, read_invoice
 from margeresto.matching import base_qty_from_unit, suggest_ingredient
 
 ROOT = Path(__file__).resolve().parent
 IGNORE = "— ignorer (frais, consigne…) —"
 PAGES: dict = {}
+SECRET_KEYS = ("ANTHROPIC_API_KEY", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM")
 
 
 # --- Mise en forme -------------------------------------------------------------
@@ -29,9 +35,10 @@ def load_env() -> None:
             if "=" in line and not line.lstrip().startswith("#"):
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-    try:  # secrets Streamlit Cloud
-        if "ANTHROPIC_API_KEY" in st.secrets:
-            os.environ.setdefault("ANTHROPIC_API_KEY", st.secrets["ANTHROPIC_API_KEY"])
+    try:  # « Secrets » Streamlit Cloud
+        for k in SECRET_KEYS:
+            if k in st.secrets:
+                os.environ.setdefault(k, str(st.secrets[k]))
     except Exception:
         pass
 
@@ -161,143 +168,153 @@ def go_product(ingredient_id: int) -> None:
     st.switch_page(PAGES["produit"])
 
 
-# --- Accueil -------------------------------------------------------------------
+def toast_done() -> None:
+    msg = st.session_state.pop("done", None)
+    if msg:
+        st.success(msg)
 
-def page_home():
+
+# --- Alertes (accueil) ---------------------------------------------------------
+
+def page_alerts():
     conn = get_conn()
-    st.title("Ta marge en un coup d'œil")
-    ranking = pricing.impact_ranking(conn)
-    if not ranking:
+    st.title("Tes alertes")
+    toast_done()
+    if not conn.execute("SELECT 1 FROM invoices LIMIT 1").fetchone():
         empty_state()
         return
-    total_margin = pricing.monthly_margin(conn)
-    lost = sum(r["monthly_impact"] for r in ranking)
-    hikes = [r for r in ranking if r["monthly_impact"] < -0.5]
-    n_alerts = len(pricing.price_alerts(conn))
-    reports = [r for r in pricing.all_dish_reports(conn) if r.cost_now > 0]
-    hit = [r for r in reports if r.margin_drift_pts < -0.05]
+    alerts = actions.open_alerts(conn)
+    rec = actions.recovery_summary(conn)
+    errors = credits.billing_errors(conn)
 
-    if lost < 0:
-        slate("Ce que les hausses de tes fournisseurs te coûtent chaque mois", eur(-lost, 0),
-              f"Soit {eur(-lost * 12, 0)} sur un an, par rapport aux prix des 90 derniers jours.")
+    if alerts:
+        slate("Marge à récupérer chaque mois", eur(rec.open, 0),
+              f"{len(alerts)} hausse{'s' if len(alerts) > 1 else ''} à traiter. "
+              f"Déjà récupéré : {eur(rec.recovered, 0)} par mois sur {eur(rec.detected, 0)} de hausses "
+              "détectées ces 90 derniers jours.")
     else:
-        slate("Les variations de prix te font gagner chaque mois", eur(lost, 0), tone="gain")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Produits en hausse", n_alerts,
-              help=f"Hausse d'au moins {pct(db.get_setting(conn, 'alert_threshold'), 0)} (réglable dans Paramètres).")
-    c2.metric("Plats touchés", f"{len(hit)} sur {len(reports)}")
-    c3.metric("Marge brute par mois", eur(total_margin, 0))
+        slate("Toutes les hausses sont traitées. Marge récupérée chaque mois", eur(rec.recovered, 0),
+              f"Sur {eur(rec.detected, 0)} de hausses détectées ces 90 derniers jours.", "gain")
 
-    st.subheader("Les hausses qui te coûtent le plus")
-    if not hikes:
-        st.success("Aucune hausse qui pèse sur ta marge en ce moment.")
-    for r in hikes[:3]:
+    if rec.detected > 0:
+        share = min(rec.recovered / rec.detected, 1.0)
+        st.progress(share, text=f"{pct(share, 0)} de la marge menacée déjà récupérée")
+
+    st.subheader("À traiter")
+    if not alerts:
+        st.success("Rien à traiter. La prochaine facture sera vérifiée automatiquement.")
+    for a in alerts:
         with st.container(border=True):
-            a, b, c = st.columns([3, 2, 1], vertical_alignment="center")
-            a.markdown(f"**{r['name']}**  \n<span class='muted'>chez {r['supplier']}, dans "
-                       f"{r['dishes']} plat{'s' if r['dishes'] > 1 else ''}</span>", unsafe_allow_html=True)
-            b.markdown(f"<span class='pill loss'>{pct(r['change'], sign=True)}</span> "
-                       f"<span class='red num'><b>{eur(r['monthly_impact'], 0)}</b> par mois</span>",
+            x, y, z = st.columns([3, 3, 1], vertical_alignment="center")
+            n = len(a.dishes)
+            x.markdown(f"**{a.name}**  \n<span class='muted'>chez {a.supplier}, "
+                       + (f"dans {n} plat{'s' if n > 1 else ''}" if n else "dans aucun plat") + "</span>",
                        unsafe_allow_html=True)
-            c.button("Voir", key=f"see_{r['ingredient_id']}", on_click=go_product,
-                     args=(r["ingredient_id"],), width="stretch")
+            y.markdown(f"<span class='pill loss'>{pct(a.change, sign=True)}</span> "
+                       f"<span class='red num'><b>{eur(a.monthly_impact, 0)}</b> par mois</span>",
+                       unsafe_allow_html=True)
+            z.button("Traiter", key=f"todo_{a.ingredient_id}", on_click=go_product,
+                     args=(a.ingredient_id,), type="primary", width="stretch")
 
-    if hit:
-        st.subheader("Les plats à repricer")
-        for r in sorted(hit, key=lambda r: r.monthly_impact)[:3]:
-            vat = conn.execute("SELECT vat_rate FROM dishes WHERE id = ?", (r.dish_id,)).fetchone()[0]
+    if errors:
+        st.subheader("Avoirs à demander")
+        st.caption("Ces prix dépassent les tarifs que tu as négociés : ce n'est pas une hausse, "
+                   "c'est une erreur de facturation à te faire rembourser.")
+        name = db.get_text(conn, "restaurant_name")
+        for group in credits.group_by_invoice(errors):
+            first, total = group[0], sum(e.amount for e in group)
+            subject, body = credits.claim_email(group, name)
             with st.container(border=True):
-                a, b = st.columns([3, 3], vertical_alignment="center")
-                a.markdown(f"**{r.name}**  \n<span class='muted'>marge {pct(r.margin_rate_ref)} → "
-                           f"{pct(r.margin_rate_now)}</span>", unsafe_allow_html=True)
-                b.markdown(f"Passer de **{eur(r.price_ttc)}** à **{eur(r.price_ttc_to_keep_margin_eur(vat))}**"
-                           f"  \n<span class='muted'>pour garder la même marge par assiette</span>",
+                x, y = st.columns([4, 2], vertical_alignment="center")
+                d = date.fromisoformat(first.invoice_date).strftime("%d/%m/%Y")
+                x.markdown(f"**{first.supplier}**, facture n° {first.invoice_number} du {d}  \n"
+                           f"<span class='muted'>{', '.join(e.ingredient for e in group)}</span>",
                            unsafe_allow_html=True)
+                y.markdown(f"<span class='big brass'>{eur(total)}</span> <span class='muted'>HT</span>",
+                           unsafe_allow_html=True)
+                with st.expander("Voir l'e-mail de demande d'avoir"):
+                    st.code(f"Objet : {subject}\n\n{body}", language=None, wrap_lines=True)
+                    b1, b2 = st.columns(2)
+                    b1.link_button("Ouvrir dans ma messagerie",
+                                   f"mailto:?subject={quote(subject)}&body={quote(body)}", width="stretch")
+                    if b2.button("C'est envoyé", key=f"claim_{first.invoice_id}", width="stretch"):
+                        credits.mark_claimed(conn, group)
+                        st.session_state["done"] = f"Demande d'avoir de {eur(total)} notée."
+                        st.rerun()
 
-    saving = sum(c.monthly_saving for c in suppliers.compare_all(conn))
-    if saving > 0.5:
-        with st.container(border=True):
-            a, b = st.columns([5, 1], vertical_alignment="center")
-            a.markdown(f"En changeant de fournisseur sur certains produits, tu économiserais "
-                       f"<span class='brass'><b>{eur(saving, 0)} par mois</b></span>.", unsafe_allow_html=True)
-            if b.button("Comparer", width="stretch"):
-                st.switch_page(PAGES["fournisseurs"])
-
-    st.caption("Calculs à volumes de vente constants.")
+    if rec.handled:
+        with st.expander(f"Traitées ces 90 derniers jours ({len(rec.handled)})"):
+            for h in rec.handled:
+                d = date.fromisoformat(h["handled_on"]).strftime("%d/%m")
+                st.markdown(f"**{h['name']}** : {actions.KINDS[h['kind']].lower()}"
+                            + (f", {eur(h['recovered_monthly'], 0)} par mois récupérés" if h["recovered_monthly"] else "")
+                            + f" <span class='muted'>(le {d}{', ' + h['detail'] if h['detail'] else ''})</span>",
+                            unsafe_allow_html=True)
 
 
-# --- Par produit ---------------------------------------------------------------
+# --- Par produit -------------------------------------------------------------------
 
 def page_product():
     conn = get_conn()
-    st.title("Impact d'un produit")
-    ranking = pricing.impact_ranking(conn)
-    if not ranking:
+    st.title("Par produit")
+    toast_done()
+    statuses = [p for p in pricing.all_price_status(conn) if p.current is not None]
+    if not statuses:
         empty_state()
         return
-    ids = [r["ingredient_id"] for r in ranking]
-    label = {r["ingredient_id"]: f"{r['name']}  ({pct(r['change'], sign=True)})" if r["change"] is not None
-             else r["name"] for r in ranking}
-    default = st.session_state.get("produit", ids[0])
-    pick = st.selectbox("Produit", ids, index=ids.index(default) if default in ids else 0,
-                        format_func=label.get, label_visibility="collapsed")
+    alerts = {a.ingredient_id: a for a in actions.open_alerts(conn)}
+    # produits en alerte d'abord, puis par ordre alphabétique
+    order = list(alerts) + [p.ingredient_id for p in statuses if p.ingredient_id not in alerts]
+    names = {p.ingredient_id: p.name for p in statuses}
+    default = st.session_state.get("produit", order[0])
+    pick = st.selectbox("Produit", order, index=order.index(default) if default in order else 0,
+                        format_func=lambda i: f"{names[i]}  (à traiter)" if i in alerts else names[i],
+                        label_visibility="collapsed")
     st.session_state["produit"] = pick
+    alert = alerts.get(pick)
 
-    sim = None
+    if alert:
+        slate(f"{alert.name} : le prix est passé de {eur(alert.price_before)} à {eur(alert.price_after)} "
+              f"le {alert.base_unit} ({pct(alert.change, sign=True)}). Ce que ça te coûte chaque mois :",
+              eur(alert.monthly_impact, 0, sign=True),
+              f"Soit {eur(alert.monthly_impact * 12, 0, sign=True)} sur un an. Dernier achat chez {alert.supplier}.")
+        action_plan(conn, alert)
+        dishes, unit = alert.dishes, alert.base_unit
+    else:
+        imp = pricing.ingredient_impact(conn, pick)
+        s, dishes, unit = imp["status"], imp["dishes"], imp["status"].base_unit
+        la = actions.last_action(conn, pick)
+        sub = (f"Dernier traitement : {actions.KINDS[la['kind']].lower()} le "
+               f"{date.fromisoformat(la['handled_on']).strftime('%d/%m')}." if la else
+               "Pas de hausse à traiter sur ce produit.")
+        slate(f"{s.name} : dernier prix payé chez {s.supplier}", f"{eur(s.current)} / {unit}", sub, "gain")
+
     with st.expander("Et si le prix bougeait ? (simulation)"):
-        on = st.toggle("Simuler une variation à partir du prix actuel")
-        if on:
-            sim = st.slider("Variation du prix", -30, 50, 10, format="%d %%") / 100
+        sim = st.slider("Variation du prix à partir du prix actuel", -30, 50, 10, format="%d %%") / 100
+        simp = pricing.ingredient_impact(conn, pick, sim)
+        total = sum(d.monthly_impact for d in simp["dishes"])
+        st.markdown(f"À {eur(simp['price_after'])} le {unit}, ta marge bougerait de "
+                    f"**{eur(total, 0, sign=True)} par mois** ({eur(total * 12, 0, sign=True)} sur un an).")
 
-    imp = pricing.ingredient_impact(conn, pick, sim)
-    s, dishes = imp["status"], imp["dishes"]
-    before, after = imp["price_before"], imp["price_after"]
-    change = after / before - 1 if before else 0.0
-    monthly = sum(d.monthly_impact for d in dishes)
-    unit = s.base_unit
+    if dishes:
+        st.subheader(f"Dans tes plats ({len(dishes)})")
+        for d in sorted(dishes, key=lambda d: d.monthly_impact):
+            with st.container(border=True):
+                x, y = st.columns([3, 2], vertical_alignment="center")
+                x.markdown(f"**{d.dish}**  \n<span class='muted'>{qty(d.gross_qty, unit)} par assiette, "
+                           f"{d.monthly_volume:.0f} vendus par mois, {eur(d.price_ttc)} TTC</span>",
+                           unsafe_allow_html=True)
+                if alert:
+                    y.markdown(f"<span class='red num'><b>{eur(d.monthly_impact, 0, sign=True)}</b> par mois</span>  \n"
+                               f"<span class='muted'>marge {pct(d.margin_rate_before)} → {pct(d.margin_rate_after)}</span>",
+                               unsafe_allow_html=True)
+                else:
+                    y.markdown(f"<span class='muted'>marge</span> **{pct(d.margin_rate_after)}**",
+                               unsafe_allow_html=True)
+    else:
+        st.info("Ce produit n'entre dans aucun plat. Ajoute-le à une fiche dans **Ma carte**.")
 
-    verb = "passerait" if sim is not None else "est passé"
-    tone = "loss" if monthly < 0 else "gain"
-    slate(f"{s.name} : le prix {verb} de {eur(before)} à {eur(after)} le {unit} ({pct(change, sign=True)}). "
-          f"Effet sur ta marge chaque mois :",
-          eur(monthly, 0, sign=True),
-          f"Soit {eur(monthly * 12, 0, sign=True)} sur un an."
-          + ("" if sim is not None else f" Dernier achat chez {s.supplier}, comparé à la moyenne des 90 jours précédents."),
-          tone)
-
-    if not dishes:
-        st.info("Ce produit n'entre dans aucun plat de la carte.")
-        return
-
-    # Un bloc par plat
-    st.subheader(f"Dans tes plats ({len(dishes)})")
-    for d in sorted(dishes, key=lambda d: d.monthly_impact):
-        with st.container(border=True):
-            a, b, c = st.columns([3, 2, 3], vertical_alignment="center")
-            a.markdown(f"**{d.dish}**  \n<span class='muted'>{qty(d.gross_qty, unit)} par assiette, "
-                       f"{d.monthly_volume:.0f} vendus par mois</span>", unsafe_allow_html=True)
-            cls = "red" if d.monthly_impact < 0 else "green"
-            b.markdown(f"<span class='{cls} num'><b>{eur(d.monthly_impact, 0, sign=True)}</b> par mois</span>  \n"
-                       f"<span class='muted'>marge {pct(d.margin_rate_before)} → {pct(d.margin_rate_after)}</span>",
-                       unsafe_allow_html=True)
-            if abs(d.extra_per_portion) >= 0.005:
-                c.markdown(f"Prix conseillé : **{eur(d.price_ttc_to_keep_margin_eur)}**  \n"
-                           f"<span class='muted'>au lieu de {eur(d.price_ttc)}</span>", unsafe_allow_html=True)
-            else:
-                c.markdown("<span class='muted'>Rien à changer</span>", unsafe_allow_html=True)
-
-    cmp_ = suppliers.compare_ingredient(conn, pick)
-    st.subheader("Chez tes fournisseurs")
-    if cmp_:
-        for o in cmp_.offers:
-            best = o is cmp_.best and cmp_.has_alternative
-            st.markdown(("🏆 " if best else "• ") + _offer_line(o, unit, cmp_, current=o.supplier == cmp_.current.supplier)
-                        + (" <span class='muted'>(ton fournisseur actuel)</span>" if o.supplier == cmp_.current.supplier else ""),
-                        unsafe_allow_html=True)
-        if cmp_.monthly_saving > 0.5:
-            st.success(f"Passer chez {cmp_.best.supplier} : {eur(cmp_.monthly_saving, 0)} d'économie par mois.")
-    with st.popover("+ Ajouter le prix d'un autre fournisseur"):
-        quote_form(conn, key="prod", ingredient_id=pick)
+    suppliers_block(conn, pick, unit)
 
     hist = pricing.price_history(conn, pick)
     if len(hist) > 1:
@@ -307,62 +324,149 @@ def page_product():
             st.line_chart(h.groupby("date")["price"].mean(), y_label=f"€ HT / {unit}", height=220)
 
 
-# --- Fournisseurs --------------------------------------------------------------
+def action_plan(conn, alert: actions.OpenAlert):
+    st.subheader("Que faire ?")
+    errs = [e for e in credits.billing_errors(conn) if e.ingredient == alert.name]
+    if errs:
+        e = errs[0]
+        st.warning(f"Attention : {e.supplier} t'a facturé {eur(e.paid)} au lieu de ton tarif négocié de "
+                   f"{eur(e.agreed)} le {e.base_unit}. C'est peut-être une erreur plutôt qu'une hausse : "
+                   "demande d'abord un avoir depuis **Alertes**.")
+    loss = -alert.monthly_impact
+    t1, t2, t3, t4 = st.tabs(["Ajuster mes prix", "Changer de fournisseur", "Réduire la portion", "Absorber"])
+
+    with t1:
+        sugg = actions.suggested_prices(alert)
+        if not alert.dishes:
+            st.write("Ce produit n'entre dans aucun plat.")
+        else:
+            st.caption("Prix conseillé : garde la même marge en euros par assiette, arrondi aux 10 centimes. "
+                       "Les plats où la hausse pèse moins de 5 centimes ne sont pas touchés.")
+            new = {}
+            for d in sorted(alert.dishes, key=lambda d: d.monthly_impact):
+                x, y = st.columns([3, 2], vertical_alignment="center")
+                x.markdown(f"**{d.dish}**  \n<span class='muted'>aujourd'hui {eur(d.price_ttc)}</span>",
+                           unsafe_allow_html=True)
+                v = y.number_input("Nouveau prix TTC", value=float(sugg.get(d.dish_id, d.price_ttc)),
+                                   min_value=0.0, step=0.10, format="%.2f", key=f"px_{alert.ingredient_id}_{d.dish_id}")
+                if abs(v - d.price_ttc) > 0.001:
+                    new[d.dish_id] = round(v, 2)
+            gain = actions.reprice_recovery(alert, new)
+            effect_line(gain, loss)
+            if st.button("Appliquer ces prix", type="primary", disabled=not new, key="do_reprice"):
+                r = actions.apply_reprice(conn, alert, new)
+                st.session_state["done"] = f"Prix mis à jour : {eur(r, 0)} de marge récupérés par mois."
+                st.rerun()
+
+    with t2:
+        opt = actions.supplier_option(conn, alert)
+        if opt:
+            b = opt.best
+            st.markdown(f"**{b.supplier}** te le vend {eur(b.price)} le {alert.base_unit} au lieu de "
+                        f"{eur(opt.current.price)} ({pct(b.price / opt.current.price - 1, sign=True)}), "
+                        f"d'après {'ta facture' if b.source == 'facture' else 'son devis'} du "
+                        f"{date.fromisoformat(b.date).strftime('%d/%m')}.")
+            effect_line(opt.monthly_saving, loss)
+            if st.button(f"Je passe chez {b.supplier}", type="primary", key="do_supplier"):
+                r = actions.apply_supplier(conn, alert, opt)
+                st.session_state["done"] = f"Changement noté : {eur(r, 0)} de marge récupérés par mois."
+                st.rerun()
+        else:
+            st.write("Aucun fournisseur moins cher connu pour ce produit, avec un prix de moins de 2 mois.")
+            st.caption("Demande un devis à un autre fournisseur et ajoute son prix plus bas, dans "
+                       "« Chez tes fournisseurs ».")
+
+    with t3:
+        if not alert.dishes:
+            st.write("Ce produit n'entre dans aucun plat.")
+        else:
+            st.caption("À réserver aux plats où la portion reste généreuse. Quantité nette dans l'assiette.")
+            new_q = {}
+            for d in sorted(alert.dishes, key=lambda d: d.monthly_impact):
+                x, y = st.columns([3, 2], vertical_alignment="center")
+                x.markdown(f"**{d.dish}**  \n<span class='muted'>aujourd'hui {qty(d.net_qty, alert.base_unit)}</span>",
+                           unsafe_allow_html=True)
+                step = 0.005 if alert.base_unit in ("kg", "L") else 1.0
+                v = y.number_input(f"Nouvelle quantité ({alert.base_unit})", value=float(d.net_qty), min_value=0.0,
+                                   step=step, format="%.3f" if step < 1 else "%.0f",
+                                   key=f"q_{alert.ingredient_id}_{d.dish_id}")
+                if abs(v - d.net_qty) > 1e-9:
+                    new_q[d.dish_id] = v
+            gain = actions.grammage_recovery(alert, new_q)
+            effect_line(gain, loss)
+            if st.button("Appliquer ces portions", type="primary", disabled=not new_q, key="do_grammage"):
+                r = actions.apply_grammage(conn, alert, new_q)
+                st.session_state["done"] = f"Fiches mises à jour : {eur(r, 0)} de marge récupérés par mois."
+                st.rerun()
+
+    with t4:
+        st.write(f"Tu gardes tes prix et tes recettes : ta marge baisse de {eur(loss, 0)} par mois "
+                 f"({eur(loss * 12, 0)} sur un an). L'alerte se rouvrira si le prix monte encore.")
+        if st.button("Absorber cette hausse", key="do_absorb"):
+            actions.absorb(conn, alert)
+            st.session_state["done"] = f"Hausse sur {alert.name} absorbée."
+            st.rerun()
+
+
+def effect_line(gain: float, loss: float) -> None:
+    if gain <= 0:
+        st.markdown("<span class='muted'>Modifie une valeur pour voir l'effet.</span>", unsafe_allow_html=True)
+        return
+    if gain >= loss:
+        st.markdown(f"<span class='brass'><b>Toute la perte est récupérée</b></span> ({eur(loss, 0)} par mois)"
+                    + (f", et {eur(gain - loss, 0)} de marge en plus." if gain - loss >= 1 else "."),
+                    unsafe_allow_html=True)
+    else:
+        st.markdown(f"Marge récupérée : <span class='brass'><b>{eur(gain, 0)} par mois</b></span> "
+                    f"sur {eur(loss, 0)} perdus ({pct(gain / loss, 0)}).", unsafe_allow_html=True)
+
+
+def suppliers_block(conn, pick: int, unit: str):
+    st.subheader("Chez tes fournisseurs")
+    cmp_ = suppliers.compare_ingredient(conn, pick)
+    if cmp_:
+        for o in cmp_.offers:
+            best = o is cmp_.best and cmp_.has_alternative
+            st.markdown(("🏆 " if best else "• ") + _offer_line(o, unit, cmp_, current=o.supplier == cmp_.current.supplier)
+                        + (" <span class='muted'>(ton fournisseur actuel)</span>"
+                           if o.supplier == cmp_.current.supplier else ""), unsafe_allow_html=True)
+    neg = credits.negotiated_list(conn, pick)
+    if neg:
+        st.markdown("Tarifs négociés : " + ", ".join(
+            f"**{n['supplier']}** {eur(n['price'])} le {unit} <span class='muted'>(depuis le "
+            f"{date.fromisoformat(n['valid_from']).strftime('%d/%m/%Y')})</span>" for n in neg),
+            unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    with c1.popover("+ Prix d'un autre fournisseur", width="stretch"):
+        quote_form(conn, key="prod", ingredient_id=pick)
+    with c2.popover("+ Tarif négocié", width="stretch"):
+        negotiated_form(conn, pick, unit)
+
+
+def negotiated_form(conn, ingredient_id: int, unit: str):
+    st.caption("Le prix convenu avec ton fournisseur. Chaque facture au-dessus sera signalée "
+               "comme une erreur, avec un e-mail de demande d'avoir prêt à envoyer.")
+    known = [r["name"] for r in conn.execute("SELECT name FROM suppliers ORDER BY name")]
+    with st.form(f"neg_{ingredient_id}", clear_on_submit=True, border=False):
+        sup = st.selectbox("Fournisseur", known) if known else st.text_input("Fournisseur")
+        price = st.number_input(f"Tarif HT par {unit}", min_value=0.0, step=0.1, format="%.2f")
+        since = st.date_input("Valable depuis le", date.today(), format="DD/MM/YYYY")
+        if st.form_submit_button("Enregistrer le tarif"):
+            if not sup or price <= 0:
+                st.error("Indique le fournisseur et le tarif.")
+            else:
+                credits.set_negotiated(conn, ingredient_id, sup, price, since.isoformat())
+                st.session_state["done"] = "Tarif négocié enregistré."
+                st.rerun()
+
+
+# --- Fournisseurs : prix comparés et devis ---------------------------------------
 
 def _offer_line(o, unit: str, cmp_, current: bool = False) -> str:
     when = date.fromisoformat(o.date).strftime("%d/%m")
     tag = f"{'facture' if o.source == 'facture' else 'devis'} du {when}"
     stale = " <span class='pill loss'>à confirmer</span>" if cmp_.is_stale(o) and not current else ""
     return f"**{o.supplier}**, {eur(o.price)} le {unit} <span class='muted'>({tag})</span>{stale}"
-
-
-def page_suppliers():
-    conn = get_conn()
-    st.title("Comparateur de fournisseurs")
-    comps = suppliers.compare_all(conn)
-    if not comps:
-        empty_state()
-        return
-    deals = [c for c in comps if c.monthly_saving > 0.5]
-    total = sum(c.monthly_saving for c in deals)
-    if deals:
-        slate(f"En changeant de fournisseur sur {len(deals)} produit{'s' if len(deals) > 1 else ''}, "
-              "tu économiserais chaque mois", eur(total, 0),
-              f"Soit {eur(total * 12, 0)} sur un an, d'après les quantités que tu as achetées ces 90 derniers jours.",
-              "gain")
-    else:
-        st.success("Tu achètes déjà chaque produit au meilleur prix connu.")
-
-    for c in deals:
-        u = c.base_unit
-        with st.container(border=True):
-            a, b = st.columns([4, 2], vertical_alignment="center")
-            a.markdown(f"#### {c.name}")
-            a.markdown("Aujourd'hui : " + _offer_line(c.current, u, c, current=True), unsafe_allow_html=True)
-            a.markdown(f"Moins cher ({pct(c.best.price / c.current.price - 1, sign=True)}) : "
-                       + _offer_line(c.best, u, c), unsafe_allow_html=True)
-            b.markdown(f"<span class='big brass'>{eur(c.monthly_saving, 0)}</span><br>"
-                       f"<span class='muted'>d'économie par mois, sur {qty(c.monthly_qty, u)} achetés</span>",
-                       unsafe_allow_html=True)
-            b.button("Voir le produit", key=f"cmp_{c.ingredient_id}", on_click=go_product,
-                     args=(c.ingredient_id,))
-
-    to_check = [c for c in comps if c.stale_cheaper]
-    if to_check:
-        st.subheader("À redemander")
-        st.caption("Ces prix sont moins chers mais datent de plus de 2 mois : demande un prix à jour.")
-        for c in to_check:
-            o = c.stale_cheaper[0]
-            st.markdown(f"• {c.name} : " + _offer_line(o, c.base_unit, c)
-                        + f" vs {eur(c.current.price)} aujourd'hui", unsafe_allow_html=True)
-
-    single = [c.name for c in comps if not c.has_alternative]
-    if single:
-        st.caption(f"Pas encore comparés (un seul fournisseur connu) : {', '.join(single)}. "
-                   "Ajoute un devis ci-dessous pour les comparer.")
-
-    st.subheader("Ajouter un prix d'un autre fournisseur")
-    quote_form(conn, key="sup")
 
 
 def quote_form(conn, key: str, ingredient_id: int | None = None):
@@ -441,12 +545,13 @@ def page_invoices():
     draft = st.session_state.get("draft")
 
     if not draft:
-        up = st.file_uploader("Dépose une facture (PDF ou photo)", type=["pdf", "png", "jpg", "jpeg", "webp"])
+        up = st.file_uploader("Dépose une facture : PDF, photo ou fichier Factur-X (.xml)",
+                              type=["pdf", "png", "jpg", "jpeg", "webp", "xml"])
         c1, c2 = st.columns([1, 3])
-        if c1.button("Lire la facture", type="primary", disabled=not (up and api_key_available())):
+        if c1.button("Lire la facture", type="primary", disabled=not up):
             with st.spinner("Lecture en cours…"):
                 try:
-                    st.session_state.draft = extract_invoice(up.getvalue(), up.name)
+                    st.session_state.draft = read_invoice(up.getvalue(), up.name)
                     st.session_state.draft["source_file"] = up.name
                     st.rerun()
                 except ExtractionError as e:
@@ -457,8 +562,9 @@ def page_invoices():
                                       "lines": [{"label": "", "quantity": 1.0, "unit": "", "unit_price_ht": 0.0,
                                                  "is_product": True}]}
             st.rerun()
-        if not api_key_available():
-            st.caption("Lecture automatique inactive : la clé API Claude n'est pas configurée.")
+        st.caption("Les factures électroniques (Factur-X) sont lues directement, sans frais. "
+                   + ("Les autres sont lues par l'IA." if api_key_available()
+                      else "Pour les PDF scannés et les photos, il faut configurer la clé API Claude."))
 
         rows = conn.execute(
             "SELECT i.id, i.invoice_date, s.name AS supplier, i.invoice_number, i.total_ht FROM invoices i "
@@ -475,6 +581,8 @@ def page_invoices():
 
     # Vérification d'une facture lue
     st.subheader("Vérifie la facture")
+    if draft.get("method") == "facturx":
+        st.success("Facture électronique lue directement : les montants sont exacts.")
     c1, c2, c3 = st.columns(3)
     supplier = c1.text_input("Fournisseur", draft["supplier"])
     number = c2.text_input("N° de facture", draft["invoice_number"])
@@ -535,21 +643,48 @@ def page_invoices():
             for e in errors:
                 st.error(e)
             return
-        db.save_invoice(conn, supplier, number, inv_date.isoformat(), lines, total or None,
-                        draft.get("source_file", ""))
+        inv_id = db.save_invoice(conn, supplier, number, inv_date.isoformat(), lines, total or None,
+                                 draft.get("source_file", ""))
         st.session_state.pop("draft", None)
         touched = {l["ingredient_id"] for l in lines if l["ingredient_id"]}
-        st.session_state["flash"] = [a for a in pricing.price_alerts(conn) if a.ingredient_id in touched]
+        line_ids = {r[0] for r in conn.execute("SELECT id FROM invoice_lines WHERE invoice_id = ?", (inv_id,))}
+        hits = [a for a in actions.open_alerts(conn) if a.ingredient_id in touched]
+        errs = [e for e in credits.billing_errors(conn, days=None) if e.line_id in line_ids]
+        emailed = None
+        to = db.get_text(conn, "alert_email")
+        msg = notify.invoice_alert(conn, touched, line_ids)
+        if msg and to and notify.email_configured():
+            try:
+                notify.send_email(to, *msg)
+                emailed = to
+            except Exception as e:  # l'enregistrement ne doit pas échouer à cause de l'e-mail
+                emailed = f"échec : {e}"
+        st.session_state["flash"] = {"alerts": [a.ingredient_id for a in hits],
+                                     "errors": sum(e.amount for e in errs), "emailed": emailed}
         st.rerun()
 
 
 def flash_after_invoice():
-    alerts = st.session_state.pop("flash", None)
-    if alerts is None:
+    flash = st.session_state.pop("flash", None)
+    if flash is None:
         return
+    conn = get_conn()
     st.success("Facture enregistrée.")
-    for a in alerts:
-        st.warning(f"**{a.name}** en hausse de {pct(a.change, sign=True)} ({eur(a.current)} / {a.base_unit}).")
+    for ing_id in flash["alerts"]:
+        a = actions.alert_for(conn, ing_id)
+        if a is None:
+            continue
+        with st.container(border=True):
+            x, y = st.columns([5, 1], vertical_alignment="center")
+            x.markdown(f"<span class='pill loss'>{pct(a.change, sign=True)}</span> **{a.name}** : "
+                       f"<span class='red'>{eur(a.monthly_impact, 0)} de marge par mois</span>",
+                       unsafe_allow_html=True)
+            y.button("Traiter", key=f"flash_{ing_id}", on_click=go_product, args=(ing_id,), type="primary")
+    if flash["errors"] > 0:
+        st.warning(f"Prix au-dessus de tes tarifs négociés : {eur(flash['errors'])} HT d'avoir à demander "
+                   "(voir **Alertes**).")
+    if flash["emailed"]:
+        st.caption(f"Alerte envoyée par e-mail à {flash['emailed']}.")
 
 
 # --- Ma carte ------------------------------------------------------------------
@@ -662,17 +797,45 @@ def page_settings():
     conn = get_conn()
     st.title("Paramètres")
     with st.form("settings"):
+        name = st.text_input("Nom du restaurant (signature des e-mails)", db.get_text(conn, "restaurant_name"))
+        email = st.text_input("Recevoir les alertes à cette adresse", db.get_text(conn, "alert_email"),
+                              placeholder="toi@exemple.fr")
         thr = st.slider("Alerter à partir d'une hausse de", 1, 30,
                         int(round(db.get_setting(conn, "alert_threshold") * 100)), format="%d %%")
+        eur_min = st.slider("…ou dès qu'une hausse coûte au moins (par mois)", 10, 300,
+                            int(db.get_setting(conn, "alert_min_monthly")), step=10, format="%d €")
         days = st.slider("Comparer au prix moyen des derniers", 30, 365,
                          int(db.get_setting(conn, "reference_days")), format="%d jours")
         tgt = st.slider("Coût matière maximum par plat", 15, 50,
                         int(round(db.get_setting(conn, "target_food_cost") * 100)), format="%d %%")
-        if st.form_submit_button("Enregistrer"):
+        if st.form_submit_button("Enregistrer", type="primary"):
+            db.set_setting(conn, "restaurant_name", name.strip())
+            db.set_setting(conn, "alert_email", email.strip())
             db.set_setting(conn, "alert_threshold", thr / 100)
+            db.set_setting(conn, "alert_min_monthly", eur_min)
             db.set_setting(conn, "reference_days", days)
             db.set_setting(conn, "target_food_cost", tgt / 100)
             st.success("C'est enregistré.")
+
+    st.subheader("Alertes par e-mail")
+    to = db.get_text(conn, "alert_email")
+    if notify.email_configured():
+        st.write("Envoi activé : une alerte part à chaque facture qui contient une hausse ou une erreur.")
+        c1, c2 = st.columns(2)
+        if c1.button("Envoyer le résumé de la semaine", disabled=not to, width="stretch"):
+            try:
+                notify.send_email(to, *notify.weekly_summary(conn))
+                st.success(f"Résumé envoyé à {to}.")
+            except Exception as e:
+                st.error(f"L'envoi a échoué : {e}")
+        if not to:
+            c2.caption("Indique ton adresse ci-dessus.")
+    else:
+        st.write("Envoi non configuré. Ajoute `SMTP_HOST`, `SMTP_USER` et `SMTP_PASSWORD` dans les secrets "
+                 "de l'app (voir le README).")
+    with st.expander("Aperçu du résumé de la semaine"):
+        subject, body = notify.weekly_summary(conn)
+        st.code(f"Objet : {subject}\n\n{body}", language=None, wrap_lines=True)
 
     st.subheader("Démo")
     c1, c2 = st.columns(2)
@@ -680,16 +843,17 @@ def page_settings():
         try:
             demo.load_demo(conn)
             st.session_state.pop("produit", None)
-            st.switch_page(PAGES["accueil"])
+            st.switch_page(PAGES["alertes"])
         except RuntimeError as e:
             st.error(str(e))
     with c2.popover("Tout effacer"):
-        st.write("Supprime toutes les factures, produits et plats.")
+        st.write("Supprime toutes les factures, produits, plats et alertes traitées.")
         if st.button("Oui, tout effacer"):
             demo.reset(conn)
             st.session_state.pop("produit", None)
             st.rerun()
-    st.caption("Lecture automatique des factures : " + ("active ✅" if api_key_available() else "inactive (clé API absente)"))
+    st.caption("Lecture des factures scannées par l'IA : " + ("active ✅" if api_key_available()
+                                                               else "inactive (clé API absente)"))
 
 
 def main():
@@ -697,15 +861,24 @@ def main():
     st.set_page_config(page_title="Marge Resto", page_icon="🍽️", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
     st.logo(str(ROOT / "assets" / "logo.svg"), size="large", icon_image=str(ROOT / "assets" / "logo-icon.svg"))
+    n = 0
+    try:
+        n = len(actions.open_alerts(get_conn()))
+    except Exception:
+        pass
     PAGES.update({
-        "accueil": st.Page(page_home, title="Accueil", icon="🏠", url_path="accueil", default=True),
+        "alertes": st.Page(page_alerts, title=f"Alertes ({n})" if n else "Alertes", icon="🔔",
+                           url_path="alertes", default=True),
         "produit": st.Page(page_product, title="Par produit", icon="🔎", url_path="produit"),
-        "fournisseurs": st.Page(page_suppliers, title="Fournisseurs", icon="🏷️", url_path="fournisseurs"),
         "factures": st.Page(page_invoices, title="Factures", icon="🧾", url_path="factures"),
+    })
+    secondary = {
         "carte": st.Page(page_menu, title="Ma carte", icon="🍽️", url_path="carte"),
         "parametres": st.Page(page_settings, title="Paramètres", icon="⚙️", url_path="parametres"),
-    })
-    nav = st.navigation(list(PAGES.values()))
+    }
+    PAGES.update(secondary)
+    nav = st.navigation({"": [PAGES["alertes"], PAGES["produit"], PAGES["factures"]],
+                         "Réglages": list(secondary.values())})
     flash_after_invoice()
     nav.run()
 

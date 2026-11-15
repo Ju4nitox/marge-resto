@@ -22,17 +22,34 @@ python3 -m venv .venv
 
 Copie `.env.example` en `.env` et colle ta clé API Anthropic (console.anthropic.com). Chaque facture coûte quelques centimes. Sans clé, tout fonctionne sauf le bouton « Lire la facture » : on saisit les lignes à la main.
 
+## Le problème résolu
+
+Les prix fournisseurs montent par petites touches, les prix de la carte ne bougent pas, et la marge fond sans qu'on le voie jusqu'au bilan. Marge Resto détecte chaque hausse dès la facture, la chiffre sur tous les plats concernés et propose quoi faire.
+
 ## Comment ça marche
 
-| Étape | Où | Ce qui se passe |
-| --- | --- | --- |
-| 1. Facture | Factures | PDF ou photo lu par Claude → lignes produit. Tu vérifies, tu associes chaque ligne à un ingrédient. |
-| 2. Correspondance | Factures | Le lien « libellé fournisseur → ingrédient + conditionnement » est mémorisé : la facture suivante se remplit seule. |
-| 3. Prix | Par produit (historique) | Prix ramené au kg, au litre ou à la pièce. Prix de référence = moyenne des achats des 90 jours précédents. |
-| 4. Fiches techniques | Ma carte | Grammages nets, rendement, prix TTC, portions vendues par mois. |
-| 5. Impact | Par produit | Pour chaque matière première : marge perdue par mois sur tous les plats qui l'utilisent, part de la marge globale, simulation d'une hausse (ex. +10 % sur le bœuf). |
-| 6. Comparateur | Fournisseurs | Pour chaque produit, dernier prix connu chez chaque fournisseur (factures + devis saisis), économie mensuelle si on change, d'après les quantités réellement achetées. Un prix de plus de 2 mois est signalé « à redemander » et n'entre pas dans l'économie. |
-| 7. Alertes | Accueil | Hausses au-dessus du seuil (5 % par défaut), plats dont la marge recule, € perdus par mois, prix conseillé. |
+| Page | Ce qu'on y fait |
+| --- | --- |
+| **Alertes** | La marge à récupérer chaque mois, les hausses à traiter (fortes en % **ou** chères en €), les avoirs à demander quand un prix dépasse le tarif négocié (e-mail prêt à envoyer), et la marge déjà récupérée. |
+| **Par produit** | Pour un produit en hausse : ce qu'elle coûte, et « Que faire ? » avec 4 options chiffrées : ajuster les prix de la carte (prix conseillés), changer de fournisseur, réduire la portion, absorber. Un clic applique l'option et l'alerte passe en « traitée ». |
+| **Factures** | Dépôt d'une facture. Les factures électroniques Factur-X sont lues directement (gratuit, exact) ; les PDF scannés et photos par l'IA. À la validation, les hausses et erreurs apparaissent tout de suite, et partent par e-mail si c'est configuré. |
+| Ma carte | Fiches techniques (grammages, rendement, prix, ventes par mois). |
+| Paramètres | Seuils d'alerte, adresse e-mail, nom du restaurant, démo. |
+
+Une hausse traitée ne revient pas : l'alerte suivante se calcule à partir du prix accepté. La marge « récupérée » est comptée au plus égale à la marge perdue.
+
+## Alertes par e-mail
+
+Ajoute dans les *Secrets* de l'app Streamlit (ou dans `.env`) :
+
+```
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = "587"
+SMTP_USER = "ton.adresse@gmail.com"
+SMTP_PASSWORD = "mot de passe d'application"
+```
+
+Puis indique l'adresse qui reçoit les alertes dans **Paramètres**. Une alerte part à chaque facture contenant une hausse ou une erreur ; le résumé de la semaine s'envoie depuis Paramètres (pas d'envoi automatique tant que les données ne sont pas dans une base en ligne).
 
 ## Structure
 
@@ -43,6 +60,10 @@ margeresto/extraction.py   lecture des factures via l'API Claude
 margeresto/matching.py     rapprochement libellé → ingrédient, lecture des conditionnements (10X250G…)
 margeresto/pricing.py      prix de référence, alertes, coût et marge par plat
 margeresto/suppliers.py    comparateur de fournisseurs
+margeresto/actions.py      alertes à traiter, options chiffrées, marge récupérée
+margeresto/credits.py      tarifs négociés, écarts de facturation, e-mails d'avoir
+margeresto/facturx.py      lecture des factures électroniques Factur-X
+margeresto/notify.py       alertes et résumé par e-mail
 margeresto/demo.py         brasserie de démonstration (3 fournisseurs, 5 mois, 5 plats)
 tests/test_core.py         tests (python3 -m pytest)
 ```
@@ -52,4 +73,5 @@ tests/test_core.py         tests (python3 -m pytest)
 - Un seul restaurant, en local, sans comptes utilisateurs.
 - La lecture des factures n'a pas encore été testée sur de vraies factures : c'est le premier test à faire.
 - Pas d'import des ventes depuis la caisse : les portions vendues par mois se saisissent à la main.
-- Pas de lecture des factures électroniques Factur-X (prochaine étape logique).
+- Données effacées à chaque mise à jour en ligne : il faut une base de données externe avant un vrai restaurant.
+- Pas d'envoi automatique du résumé hebdomadaire, ni d'adresse e-mail pour transférer ses factures (nécessitent la base en ligne).

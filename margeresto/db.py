@@ -86,6 +86,37 @@ CREATE TABLE IF NOT EXISTS supplier_quotes (
     note TEXT DEFAULT ''
 );
 
+-- Ce que le restaurateur a fait face à une hausse : la hausse est « traitée ».
+-- kind : prix_carte | fournisseur | grammage | absorbee
+CREATE TABLE IF NOT EXISTS alert_actions (
+    id INTEGER PRIMARY KEY,
+    ingredient_id INTEGER NOT NULL REFERENCES ingredients(id) ON DELETE CASCADE,
+    price_date TEXT NOT NULL,          -- date du prix qui a déclenché l'alerte
+    price_before REAL NOT NULL,
+    price_after REAL NOT NULL,         -- prix « accepté » : base de la prochaine alerte
+    monthly_impact REAL NOT NULL,      -- marge perdue par mois (négatif)
+    kind TEXT NOT NULL,
+    recovered_monthly REAL NOT NULL DEFAULT 0,
+    detail TEXT DEFAULT '',
+    handled_on TEXT NOT NULL DEFAULT (date('now'))
+);
+
+-- Tarif convenu avec un fournisseur (€ HT par unité de base), à partir d'une date.
+CREATE TABLE IF NOT EXISTS negotiated_prices (
+    id INTEGER PRIMARY KEY,
+    ingredient_id INTEGER NOT NULL REFERENCES ingredients(id) ON DELETE CASCADE,
+    supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
+    price REAL NOT NULL,
+    valid_from TEXT NOT NULL
+);
+
+-- Écart de facturation pour lequel un avoir a été demandé.
+CREATE TABLE IF NOT EXISTS credit_claims (
+    invoice_line_id INTEGER PRIMARY KEY REFERENCES invoice_lines(id) ON DELETE CASCADE,
+    amount REAL NOT NULL,
+    claimed_on TEXT NOT NULL DEFAULT (date('now'))
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -93,7 +124,8 @@ CREATE TABLE IF NOT EXISTS settings (
 """
 
 DEFAULT_SETTINGS = {
-    "alert_threshold": "0.05",     # alerte si +5 % vs prix de référence
+    "alert_threshold": "0.05",     # alerte si +5 % vs prix de référence…
+    "alert_min_monthly": "50",     # …ou si la hausse coûte au moins 50 € de marge par mois
     "reference_days": "90",        # fenêtre du prix de référence
     "target_food_cost": "0.30",    # ratio matière cible par plat
 }
@@ -130,6 +162,11 @@ def transaction(conn: sqlite3.Connection):
 def get_setting(conn, key: str) -> float:
     row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
     return float(row["value"] if row else DEFAULT_SETTINGS[key])
+
+
+def get_text(conn, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
 
 
 def set_setting(conn, key: str, value) -> None:

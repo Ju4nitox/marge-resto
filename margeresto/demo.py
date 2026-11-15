@@ -54,6 +54,13 @@ QUOTES = [
     ("2026-08-10", "Metro", "Entrecôte", 30.20, "Prix catalogue"),
 ]
 
+# Tarifs négociés : fournisseur, ingrédient, prix HT par unité de base, valable à partir du
+NEGOTIATED = [
+    ("Boucherie Martin", "Bœuf haché 15 %", 12.60, "2026-10-01"),   # facturé 13,20 € le 4/11 : écart
+    ("Metro", "Beurre doux", 10.00, "2026-10-01"),                  # facturé 10,40 € le 4/11 : écart
+    ("Pomona", "Pommes de terre", 0.95, "2026-10-01"),             # respecté
+]
+
 # plat, prix TTC, TVA, volume mensuel, [(ingrédient, quantité nette, rendement)]
 DISHES = [
     ("Burger maison", 18.50, 0.10, 900, [
@@ -114,6 +121,9 @@ def load_demo(conn) -> None:
                      round(sum(l["line_total_ht"] for l in lines), 2), source_file="démo")
     for day, sup, ing, price, note in QUOTES:
         add_quote(conn, ing_ids[ing], sup, price, day, note)
+    from .credits import set_negotiated
+    for sup, ing, price, since in NEGOTIATED:
+        set_negotiated(conn, ing_ids[ing], sup, price, since)
 
     for name, ttc, vat, vol, items in DISHES:
         did = conn.execute(
@@ -124,9 +134,18 @@ def load_demo(conn) -> None:
                          "VALUES (?, ?, ?, ?)", (did, ing_ids[ing], q, y))
     conn.commit()
 
+    # Une hausse déjà traitée, pour montrer le compteur de marge récupérée :
+    # les œufs ont augmenté chez Metro, le restaurant est passé chez Pomona il y a 9 jours.
+    from . import actions
+    from datetime import date, timedelta
+    eggs = actions.alert_for(conn, ing_ids["Œufs"])
+    option = actions.supplier_option(conn, eggs) if eggs else None
+    if eggs and option:
+        actions.apply_supplier(conn, eggs, option, (date.today() - timedelta(days=9)).isoformat())
+
 
 def reset(conn) -> None:
-    for t in ("dish_items", "dishes", "product_mappings", "supplier_quotes", "invoice_lines", "invoices",
-              "suppliers", "ingredients"):
+    for t in ("credit_claims", "alert_actions", "negotiated_prices", "dish_items", "dishes",
+              "product_mappings", "supplier_quotes", "invoice_lines", "invoices", "suppliers", "ingredients"):
         conn.execute(f"DELETE FROM {t}")
     conn.commit()

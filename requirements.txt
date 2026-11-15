@@ -3,3 +3,4 @@ anthropic>=0.40
 rapidfuzz>=3.0
 pandas>=2.0
 pytest>=8.0
+pypdf>=4.0
