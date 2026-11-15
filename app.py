@@ -17,9 +17,10 @@ from margeresto.matching import base_qty_from_unit, suggest_ingredient
 
 ROOT = Path(__file__).resolve().parent
 IGNORE = "— ignorer (frais, consigne…) —"
+PAGES: dict = {}
 
 
-# --- Utilitaires ---------------------------------------------------------------
+# --- Mise en forme -------------------------------------------------------------
 
 def load_env() -> None:
     env = ROOT / ".env"
@@ -28,16 +29,42 @@ def load_env() -> None:
             if "=" in line and not line.lstrip().startswith("#"):
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    try:  # secrets Streamlit Cloud
+        if "ANTHROPIC_API_KEY" in st.secrets:
+            os.environ.setdefault("ANTHROPIC_API_KEY", st.secrets["ANTHROPIC_API_KEY"])
+    except Exception:
+        pass
 
 
-def eur(x: float, dec: int = 2) -> str:
-    s = f"{x:,.{dec}f}".replace(",", " ").replace(".", ",")
-    return f"{s} €"
+def eur(x: float, dec: int = 2, sign: bool = False) -> str:
+    s = f"{x:+,.{dec}f}" if sign else f"{x:,.{dec}f}"
+    return s.replace(",", " ").replace(".", ",").replace("-", "−") + " €"
 
 
 def pct(x: float, dec: int = 1, sign: bool = False) -> str:
     s = f"{x * 100:+.{dec}f}" if sign else f"{x * 100:.{dec}f}"
-    return s.replace(".", ",") + " %"
+    return s.replace(".", ",").replace("-", "−") + " %"
+
+
+def qty(q: float, unit: str) -> str:
+    """0.18 kg -> '180 g', 0.03 L -> '3 cl', 2 pièce -> '2 pièces'."""
+    if unit == "kg" and q < 1:
+        return f"{q * 1000:.0f} g"
+    if unit == "L" and q < 1:
+        return f"{q * 100:.0f} cl"
+    if unit == "pièce":
+        return f"{q:g} pièce" + ("s" if q > 1 else "")
+    return f"{q:.2f} {unit}".replace(".", ",")
+
+
+CSS = """
+<style>
+.block-container {max-width: 1100px; padding-top: 2rem;}
+.big {font-size: 2.1rem; font-weight: 700; line-height: 1.1;}
+.red {color: #c0392b;} .green {color: #1e8449;} .muted {color: #888; font-size: .9rem;}
+.lead {font-size: 1.15rem; margin: .2rem 0 1.2rem 0;}
+</style>
+"""
 
 
 @st.cache_resource
@@ -49,150 +76,137 @@ def ingredients(conn) -> list[dict]:
     return [dict(r) for r in conn.execute("SELECT * FROM ingredients ORDER BY name")]
 
 
-# --- Tableau de bord -----------------------------------------------------------
+def empty_state() -> None:
+    st.info("Pas encore de données. Va dans **Paramètres** et clique sur "
+            "« Charger la brasserie de démonstration » pour essayer.")
 
-def page_dashboard():
+
+def go_product(ingredient_id: int) -> None:
+    st.session_state["produit"] = ingredient_id
+    st.switch_page(PAGES["produit"])
+
+
+# --- Accueil -------------------------------------------------------------------
+
+def page_home():
     conn = get_conn()
-    st.title("Tableau de bord")
-    alerts = pricing.price_alerts(conn)
-    reports = [r for r in pricing.all_dish_reports(conn) if r.cost_now > 0]
-    target = db.get_setting(conn, "target_food_cost")
-
-    if not reports and not alerts:
-        st.info("Aucune donnée pour l'instant. Ajoute des factures et des plats, "
-                "ou charge la brasserie de démonstration dans **Paramètres**.")
-        return
-
-    losing = [r for r in reports if r.margin_drift_pts < -0.05]
-    impact = sum(r.monthly_impact for r in reports)
-    above = [r for r in reports if r.food_cost_now > target]
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Hausses de prix détectées", len(alerts))
-    c2.metric("Plats dont la marge recule", len(losing))
-    c3.metric("Marge perdue / mois", eur(-impact if impact < 0 else 0, 0),
-              help="À volumes de vente constants, par rapport aux prix de référence.")
-    c4.metric(f"Plats au-dessus de {pct(target, 0)} de ratio matière", len(above))
-
-    if losing:
-        st.subheader("Ce qui coûte le plus")
-        for r in sorted(losing, key=lambda r: r.monthly_impact)[:5]:
-            msg = (f"**{r.name}** : marge passée de {pct(r.margin_rate_ref)} à {pct(r.margin_rate_now)} "
-                   f"({r.margin_drift_pts:+.1f} pts".replace(".", ","))
-            if r.monthly_volume:
-                msg += f", soit {eur(-r.monthly_impact, 0)} de marge en moins par mois"
-            st.warning(msg + ").")
-
-    st.subheader("Hausses de prix fournisseurs")
-    if alerts:
-        st.dataframe(pd.DataFrame([{
-            "Ingrédient": a.name,
-            "Prix de référence": f"{eur(a.reference)} / {a.base_unit}",
-            "Dernier prix": f"{eur(a.current)} / {a.base_unit}",
-            "Variation": pct(a.change, sign=True),
-            "Fournisseur": a.supplier,
-            "Date": a.current_date,
-        } for a in alerts]), hide_index=True, width="stretch")
-    else:
-        st.success("Aucune hausse au-dessus du seuil d'alerte.")
-
-
-# --- Impact des hausses ---------------------------------------------------------
-
-def _bar(df: pd.DataFrame, label: str, value: str, title: str):
-    import altair as alt
-
-    chart = alt.Chart(df).mark_bar().encode(
-        x=alt.X(f"{value}:Q", title=title),
-        y=alt.Y(f"{label}:N", sort=alt.EncodingSortField(field=value, order="ascending"), title=None),
-        color=alt.condition(f"datum['{value}'] < 0", alt.value("#d1495b"), alt.value("#2e8b57")),
-        tooltip=[label, alt.Tooltip(f"{value}:Q", format=",.0f")],
-    ).properties(height=max(120, 34 * len(df)))
-    st.altair_chart(chart, width="stretch")
-
-
-def page_impact():
-    conn = get_conn()
-    st.title("Impact des hausses sur la marge")
-    total_margin = pricing.monthly_margin(conn)
+    st.title("Ta marge en un coup d'œil")
     ranking = pricing.impact_ranking(conn)
     if not ranking:
-        st.info("Il faut des plats avec des fiches techniques et des prix d'achat. "
-                "Charge la démo dans **Paramètres** pour essayer.")
+        empty_state()
         return
-
-    # 1. Vue d'ensemble : quelles matières premières coûtent le plus à la carte
-    st.subheader("Quelles hausses pèsent le plus")
-    st.caption("Marge perdue chaque mois sur l'ensemble des plats, du fait de la variation de prix constatée "
-               "de chaque ingrédient (dernier prix vs prix de référence), à volumes de vente constants.")
-    df = pd.DataFrame([{
-        "Ingrédient": r["name"], "Fournisseur": r["supplier"],
-        "Variation": r["change"] * 100 if r["change"] is not None else None,
-        "Plats concernés": r["dishes"], "Impact €/mois": round(r["monthly_impact"]),
-        "Part de la marge mensuelle": r["monthly_impact"] / total_margin * 100 if total_margin else None,
-    } for r in ranking])
-    moved = df[df["Impact €/mois"] != 0]
-    if not moved.empty:
-        _bar(moved, "Ingrédient", "Impact €/mois", "Marge gagnée (+) ou perdue (−) par mois, en €")
-    st.dataframe(df, hide_index=True, width="stretch", column_config={
-        "Variation": st.column_config.NumberColumn(format="%+.1f %%"),
-        "Impact €/mois": st.column_config.NumberColumn(format="%+d €"),
-        "Part de la marge mensuelle": st.column_config.NumberColumn(format="%+.2f %%"),
-    })
+    total_margin = pricing.monthly_margin(conn)
     lost = sum(r["monthly_impact"] for r in ranking)
-    verb = "coûtent" if lost < 0 else "rapportent"
-    st.write(f"Au total, les variations de prix {verb} **{eur(abs(lost), 0)} de marge par mois** "
-             f"sur une marge brute mensuelle de {eur(total_margin, 0)} "
-             f"({pct(lost / total_margin, 2, sign=True) if total_margin else '—'}).")
+    hikes = [r for r in ranking if r["monthly_impact"] < -0.5]
+    n_alerts = len(pricing.price_alerts(conn))
+    reports = [r for r in pricing.all_dish_reports(conn) if r.cost_now > 0]
+    hit = [r for r in reports if r.margin_drift_pts < -0.05]
 
-    # 2. Zoom sur un ingrédient
-    st.divider()
-    st.subheader("Zoom sur une matière première")
-    names = {r["name"]: r["ingredient_id"] for r in ranking}
-    c1, c2 = st.columns([2, 3])
-    pick = c1.selectbox("Ingrédient", list(names))  # le plus coûteux en premier
-    mode = c2.radio("Variation", ["Constatée sur les factures", "Simuler une variation"], horizontal=True)
+    color = "red" if lost < 0 else "green"
+    st.markdown(f"<div class='lead'>Les hausses fournisseurs te coûtent "
+                f"<span class='big {color}'>{eur(abs(lost), 0)}</span> de marge par mois</div>",
+                unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Sur un an", eur(lost * 12, 0))
+    c2.metric("Produits en hausse", n_alerts,
+              help=f"Hausse d'au moins {pct(db.get_setting(conn, 'alert_threshold'), 0)} (réglable dans Paramètres).")
+    c3.metric("Plats touchés", f"{len(hit)} / {len(reports)}")
+
+    st.subheader("Les hausses qui te coûtent le plus")
+    if not hikes:
+        st.success("Aucune hausse qui pèse sur ta marge en ce moment.")
+    for r in hikes[:3]:
+        with st.container(border=True):
+            a, b, c = st.columns([3, 2, 1], vertical_alignment="center")
+            a.markdown(f"**{r['name']}**  \n<span class='muted'>{r['supplier']} · "
+                       f"{r['dishes']} plat{'s' if r['dishes'] > 1 else ''}</span>", unsafe_allow_html=True)
+            b.markdown(f"<span class='red'><b>{pct(r['change'], sign=True)}</b> · "
+                       f"{eur(r['monthly_impact'], 0)} / mois</span>", unsafe_allow_html=True)
+            c.button("Voir", key=f"see_{r['ingredient_id']}", on_click=go_product,
+                     args=(r["ingredient_id"],), width="stretch")
+
+    if hit:
+        st.subheader("Les plats à repricer")
+        for r in sorted(hit, key=lambda r: r.monthly_impact)[:3]:
+            vat = conn.execute("SELECT vat_rate FROM dishes WHERE id = ?", (r.dish_id,)).fetchone()[0]
+            with st.container(border=True):
+                a, b = st.columns([3, 3], vertical_alignment="center")
+                a.markdown(f"**{r.name}**  \n<span class='muted'>marge {pct(r.margin_rate_ref)} → "
+                           f"{pct(r.margin_rate_now)}</span>", unsafe_allow_html=True)
+                b.markdown(f"Passer de **{eur(r.price_ttc)}** à **{eur(r.price_ttc_to_keep_margin_eur(vat))}**"
+                           f"  \n<span class='muted'>pour garder la même marge par assiette</span>",
+                           unsafe_allow_html=True)
+
+    st.caption(f"Marge brute mensuelle de la carte : {eur(total_margin, 0)}. "
+               "Calculs à volumes de vente constants, par rapport aux prix des 90 derniers jours.")
+
+
+# --- Par produit ---------------------------------------------------------------
+
+def page_product():
+    conn = get_conn()
+    st.title("Impact d'un produit")
+    ranking = pricing.impact_ranking(conn)
+    if not ranking:
+        empty_state()
+        return
+    ids = [r["ingredient_id"] for r in ranking]
+    label = {r["ingredient_id"]: f"{r['name']}  ({pct(r['change'], sign=True)})" if r["change"] is not None
+             else r["name"] for r in ranking}
+    default = st.session_state.get("produit", ids[0])
+    pick = st.selectbox("Produit", ids, index=ids.index(default) if default in ids else 0,
+                        format_func=label.get, label_visibility="collapsed")
+    st.session_state["produit"] = pick
+
     sim = None
-    if mode == "Simuler une variation":
-        sim = st.slider("Variation simulée du prix (%)", -30, 50, 10, step=1) / 100
+    with st.expander("Et si le prix bougeait ? (simulation)"):
+        on = st.toggle("Simuler une variation à partir du prix actuel")
+        if on:
+            sim = st.slider("Variation du prix", -30, 50, 10, format="%d %%") / 100
 
-    imp = pricing.ingredient_impact(conn, names[pick], sim)
+    imp = pricing.ingredient_impact(conn, pick, sim)
     s, dishes = imp["status"], imp["dishes"]
-    change = imp["price_after"] / imp["price_before"] - 1 if imp["price_before"] else 0.0
+    before, after = imp["price_before"], imp["price_after"]
+    change = after / before - 1 if before else 0.0
     monthly = sum(d.monthly_impact for d in dishes)
+    unit = s.base_unit
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Prix", f"{eur(imp['price_after'])} / {s.base_unit}", pct(change, sign=True), delta_color="inverse",
-              help=f"Avant : {eur(imp['price_before'])} / {s.base_unit}. Dernier fournisseur : {s.supplier}.")
-    k2.metric("Impact sur la marge / mois", ("+" if monthly > 0 else "") + eur(monthly, 0))
-    k3.metric("Impact sur la marge / an", ("+" if monthly > 0 else "") + eur(monthly * 12, 0))
-    k4.metric("Part de la marge mensuelle", pct(monthly / total_margin, 2, sign=True) if total_margin else "—")
+    # En-tête : 3 chiffres
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Prix d'achat" + (" simulé" if sim is not None else ""), f"{eur(after)} / {unit}",
+              pct(change, sign=True), delta_color="inverse")
+    c2.metric("Impact sur ta marge", f"{eur(monthly, 0, sign=True)} / mois")
+    c3.metric("Sur un an", eur(monthly * 12, 0, sign=True))
+    st.caption(f"Avant : {eur(before)} / {unit}"
+               + ("" if sim is not None else f" (moyenne des 90 jours précédents) · dernier achat chez {s.supplier}"))
 
     if not dishes:
-        st.info("Cet ingrédient n'est utilisé dans aucun plat.")
+        st.info("Ce produit n'entre dans aucun plat de la carte.")
         return
-    ddf = pd.DataFrame([{
-        "Plat": d.dish,
-        "Quantité / portion": f"{d.gross_qty:.3f} {d.base_unit}".replace(".", ","),
-        "Surcoût / portion": d.extra_per_portion,
-        "Marge avant": d.margin_rate_before * 100, "Marge après": d.margin_rate_after * 100,
-        "Portions / mois": d.monthly_volume, "Impact €/mois": d.monthly_impact,
-        "Prix TTC pour garder la marge en €": d.price_ttc_to_keep_margin_eur, "Prix TTC actuel": d.price_ttc,
-    } for d in sorted(dishes, key=lambda d: d.monthly_impact)])
-    _bar(ddf.assign(**{"Impact €/mois": ddf["Impact €/mois"].round()}), "Plat", "Impact €/mois",
-         "Marge gagnée (+) ou perdue (−) par mois, en €")
-    st.dataframe(ddf, hide_index=True, width="stretch", column_config={
-        "Surcoût / portion": st.column_config.NumberColumn(format="%+.3f €"),
-        "Marge avant": st.column_config.NumberColumn(format="%.1f %%"),
-        "Marge après": st.column_config.NumberColumn(format="%.1f %%"),
-        "Portions / mois": st.column_config.NumberColumn(format="%d"),
-        "Impact €/mois": st.column_config.NumberColumn(format="%+.0f €"),
-        "Prix TTC pour garder la marge en €": st.column_config.NumberColumn(format="%.2f €"),
-        "Prix TTC actuel": st.column_config.NumberColumn(format="%.2f €"),
-    })
-    if any(d.monthly_volume == 0 for d in dishes):
-        st.caption("Les plats sans portions vendues renseignées comptent pour 0 € : "
-                   "complète-les dans **Plats et marges**.")
+
+    # Un bloc par plat
+    st.subheader(f"Dans tes plats ({len(dishes)})")
+    for d in sorted(dishes, key=lambda d: d.monthly_impact):
+        with st.container(border=True):
+            a, b, c = st.columns([3, 2, 3], vertical_alignment="center")
+            a.markdown(f"**{d.dish}**  \n<span class='muted'>{qty(d.gross_qty, unit)} par assiette · "
+                       f"{d.monthly_volume:.0f} vendus / mois</span>", unsafe_allow_html=True)
+            cls = "red" if d.monthly_impact < 0 else "green"
+            b.markdown(f"<span class='{cls}'><b>{eur(d.monthly_impact, 0, sign=True)} / mois</b></span>  \n"
+                       f"<span class='muted'>marge {pct(d.margin_rate_before)} → {pct(d.margin_rate_after)}</span>",
+                       unsafe_allow_html=True)
+            if abs(d.extra_per_portion) >= 0.005:
+                c.markdown(f"Prix conseillé : **{eur(d.price_ttc_to_keep_margin_eur)}**  \n"
+                           f"<span class='muted'>au lieu de {eur(d.price_ttc)}</span>", unsafe_allow_html=True)
+            else:
+                c.markdown("<span class='muted'>Rien à changer</span>", unsafe_allow_html=True)
+
+    hist = pricing.price_history(conn, pick)
+    if len(hist) > 1:
+        with st.expander("Historique du prix"):
+            h = pd.DataFrame(hist)
+            h["date"] = pd.to_datetime(h["date"])
+            st.line_chart(h.groupby("date")["price"].mean(), y_label=f"€ HT / {unit}", height=220)
 
 
 # --- Factures -----------------------------------------------------------------
@@ -202,291 +216,257 @@ def _prefill_lines(conn, supplier: str, raw_lines: list[dict]) -> pd.DataFrame:
     by_id = {i["id"]: i for i in ings}
     rows = []
     for ln in raw_lines:
-        ing_name, bq, status = IGNORE, None, ""
-        if not ln.get("is_product", True):
-            status = "non-produit"
-        else:
+        ing_name, bq, status = IGNORE, None, "⚪"
+        if ln.get("is_product", True):
             known = db.known_mapping(conn, supplier, ln["label"]) if supplier else None
             if known:
                 ing = by_id[known["ingredient_id"]]
-                ing_name, bq, status = ing["name"], known["base_qty_per_unit"], "connu"
+                ing_name, bq, status = ing["name"], known["base_qty_per_unit"], "✅"
             else:
                 sugg = suggest_ingredient(ln["label"], ings, limit=1)
                 if sugg and sugg[0][1] >= 70:
                     ing = sugg[0][0]
                     ing_name = ing["name"]
                     bq = base_qty_from_unit(ln.get("unit", ""), ln["label"], ing["base_unit"])
-                    status = "à vérifier"
+                    status = "🟡"
                 else:
-                    status = "à compléter"
+                    status = "🔴"
         if ln.get("warning"):
-            status = f"{status} ⚠ {ln['warning']}".strip()
-        rows.append({
-            "Statut": status, "Désignation": ln["label"], "Qté": ln["quantity"], "Unité": ln.get("unit", ""),
-            "PU HT": ln["unit_price_ht"], "Total HT": ln.get("line_total_ht"),
-            "Ingrédient": ing_name, "Qté de base / unité": bq, "Réf.": ln.get("reference", ""),
-        })
+            status += " ⚠"
+        rows.append({"": status, "Désignation": ln["label"], "Qté": ln["quantity"], "Unité": ln.get("unit", ""),
+                     "Prix unitaire HT": ln["unit_price_ht"], "Produit": ing_name, "kg/L/pièces par unité": bq})
     return pd.DataFrame(rows)
 
 
 def _new_ingredient_form(conn, key: str):
-    with st.expander("Créer un ingrédient manquant"):
-        with st.form(f"new_ing_{key}", clear_on_submit=True):
-            c1, c2, c3 = st.columns([3, 1, 2])
-            name = c1.text_input("Nom", placeholder="ex. Beurre doux")
-            unit = c2.selectbox("Unité de base", db.BASE_UNITS)
-            cat = c3.text_input("Catégorie (optionnel)")
+    with st.popover("+ Nouveau produit"):
+        with st.form(f"new_ing_{key}", clear_on_submit=True, border=False):
+            name = st.text_input("Nom", placeholder="ex. Beurre doux")
+            unit = st.selectbox("Acheté au", db.BASE_UNITS)
             if st.form_submit_button("Créer") and name.strip():
-                db.get_or_create_ingredient(conn, name, unit, cat)
+                db.get_or_create_ingredient(conn, name, unit)
                 conn.commit()
-                st.success(f"Ingrédient « {name} » créé.")
                 st.rerun()
 
 
 def page_invoices():
     conn = get_conn()
-    st.title("Factures fournisseurs")
-    tab_add, tab_list = st.tabs(["Ajouter une facture", "Factures enregistrées"])
+    st.title("Factures")
+    draft = st.session_state.get("draft")
 
-    with tab_add:
-        if not api_key_available():
-            st.info("Lecture automatique désactivée : ajoute ta clé dans le fichier `.env` "
-                    "(`ANTHROPIC_API_KEY=...`). Tu peux saisir la facture à la main en attendant.")
-        up = st.file_uploader("Facture (PDF ou photo)", type=["pdf", "png", "jpg", "jpeg", "webp"])
-        c1, c2 = st.columns(2)
+    if not draft:
+        up = st.file_uploader("Dépose une facture (PDF ou photo)", type=["pdf", "png", "jpg", "jpeg", "webp"])
+        c1, c2 = st.columns([1, 3])
         if c1.button("Lire la facture", type="primary", disabled=not (up and api_key_available())):
-            with st.spinner("Lecture de la facture…"):
+            with st.spinner("Lecture en cours…"):
                 try:
                     st.session_state.draft = extract_invoice(up.getvalue(), up.name)
                     st.session_state.draft["source_file"] = up.name
+                    st.rerun()
                 except ExtractionError as e:
                     st.error(str(e))
-        if c2.button("Saisie manuelle"):
+        if c2.button("ou saisir à la main"):
             st.session_state.draft = {"supplier": "", "invoice_number": "", "invoice_date": str(date.today()),
                                       "total_ht": None, "source_file": "",
                                       "lines": [{"label": "", "quantity": 1.0, "unit": "", "unit_price_ht": 0.0,
-                                                 "line_total_ht": None, "is_product": True}]}
+                                                 "is_product": True}]}
+            st.rerun()
+        if not api_key_available():
+            st.caption("Lecture automatique inactive : la clé API Claude n'est pas configurée.")
 
-        draft = st.session_state.get("draft")
-        if not draft:
-            return
-
-        st.divider()
-        st.subheader("Vérifier et valider")
-        c1, c2, c3, c4 = st.columns(4)
-        supplier = c1.text_input("Fournisseur", draft["supplier"])
-        number = c2.text_input("N° de facture", draft["invoice_number"])
-        try:
-            d0 = date.fromisoformat(draft["invoice_date"])
-        except ValueError:
-            d0 = date.today()
-        inv_date = c3.date_input("Date", d0, format="DD/MM/YYYY")
-        total = c4.number_input("Total HT", value=float(draft["total_ht"] or 0.0), step=1.0)
-
-        _new_ingredient_form(conn, "inv")
-        ings = ingredients(conn)
-        names = [IGNORE] + [i["name"] for i in ings]
-        df = _prefill_lines(conn, supplier, draft["lines"])
-        st.caption("Pour chaque ligne : choisis l'ingrédient et indique combien d'unités de base "
-                   "(kg, L ou pièce) contient UNE unité facturée — ex. colis 6 × 1 L → 6. "
-                   "Ce choix est mémorisé pour les prochaines factures de ce fournisseur.")
-        edited = st.data_editor(
-            df, num_rows="dynamic", width="stretch", hide_index=True,
-            column_config={
-                "Statut": st.column_config.TextColumn(disabled=True, width="small"),
-                "Ingrédient": st.column_config.SelectboxColumn(options=names, required=True),
-                "Qté de base / unité": st.column_config.NumberColumn(min_value=0.0, format="%.3f"),
-                "PU HT": st.column_config.NumberColumn(format="%.2f €"),
-                "Total HT": st.column_config.NumberColumn(format="%.2f €"),
-            },
-            key=f"editor_{number}_{supplier}",
-        )
-        lines_sum = float((edited["Qté"].fillna(0) * edited["PU HT"].fillna(0)).sum())
-        if total and abs(lines_sum - total) > max(1.0, 0.01 * total):
-            st.warning(f"Somme des lignes {eur(lines_sum)} ≠ total HT {eur(total)} : une ligne manque ou est mal lue.")
-
-        if st.button("Valider la facture", type="primary"):
-            errors = []
-            if not supplier.strip() or not number.strip():
-                errors.append("Fournisseur et numéro de facture obligatoires.")
-            elif db.invoice_exists(conn, supplier, number):
-                errors.append("Cette facture est déjà enregistrée.")
-            id_by_name = {i["name"]: i["id"] for i in ings}
-            lines = []
-            for _, r in edited.iterrows():
-                if not str(r["Désignation"] or "").strip():
-                    continue
-                ing = r["Ingrédient"]
-                ing_id = id_by_name.get(ing) if ing and ing != IGNORE else None
-                bq = r["Qté de base / unité"]
-                bq = float(bq) if pd.notna(bq) and bq else None
-                if ing_id and not bq:
-                    errors.append(f"« {r['Désignation']} » : indique la quantité de base par unité.")
-                lines.append({"label": r["Désignation"], "reference": r["Réf."] or "",
-                              "quantity": float(r["Qté"] or 0), "unit": r["Unité"] or "",
-                              "unit_price_ht": float(r["PU HT"] or 0),
-                              "line_total_ht": float(r["Total HT"]) if pd.notna(r["Total HT"]) else None,
-                              "ingredient_id": ing_id, "base_qty_per_unit": bq if ing_id else None})
-            if errors:
-                for e in errors:
-                    st.error(e)
-            else:
-                db.save_invoice(conn, supplier, number, inv_date.isoformat(), lines,
-                                total or None, draft.get("source_file", ""))
-                st.session_state.pop("draft", None)
-                touched = {l["ingredient_id"] for l in lines if l["ingredient_id"]}
-                hits = [a for a in pricing.price_alerts(conn) if a.ingredient_id in touched]
-                st.success("Facture enregistrée.")
-                for a in hits:
-                    st.warning(f"Hausse : **{a.name}** à {eur(a.current)} / {a.base_unit} "
-                               f"({pct(a.change, sign=True)} vs référence).")
-
-    with tab_list:
         rows = conn.execute(
-            "SELECT i.id, i.invoice_date AS Date, s.name AS Fournisseur, i.invoice_number AS Numéro, "
-            "i.total_ht AS 'Total HT', COUNT(l.id) AS Lignes FROM invoices i "
-            "JOIN suppliers s ON s.id = i.supplier_id LEFT JOIN invoice_lines l ON l.invoice_id = i.id "
-            "GROUP BY i.id ORDER BY i.invoice_date DESC").fetchall()
-        if not rows:
-            st.info("Aucune facture enregistrée.")
-            return
-        df = pd.DataFrame([dict(r) for r in rows])
-        st.dataframe(df.drop(columns="id"), hide_index=True, width="stretch",
-                     column_config={"Total HT": st.column_config.NumberColumn(format="%.2f €")})
-        labels = {f"{r['Date']} · {r['Fournisseur']} · {r['Numéro']}": r["id"] for r in rows}
-        pick = st.selectbox("Voir le détail", list(labels))
-        det = conn.execute(
-            "SELECT l.label AS Désignation, l.quantity AS Qté, l.unit AS Unité, l.unit_price_ht AS 'PU HT', "
-            "COALESCE(g.name, '—') AS Ingrédient, l.base_qty_per_unit AS 'Qté de base / unité' "
-            "FROM invoice_lines l LEFT JOIN ingredients g ON g.id = l.ingredient_id WHERE l.invoice_id = ?",
-            (labels[pick],)).fetchall()
-        st.dataframe(pd.DataFrame([dict(r) for r in det]), hide_index=True, width="stretch")
-        if st.checkbox("Supprimer cette facture"):
-            if st.button("Confirmer la suppression", type="secondary"):
-                conn.execute("DELETE FROM invoices WHERE id = ?", (labels[pick],))
-                conn.commit()
-                st.rerun()
-
-
-# --- Prix des ingrédients ------------------------------------------------------
-
-def page_ingredients():
-    conn = get_conn()
-    st.title("Prix des ingrédients")
-    _new_ingredient_form(conn, "ing")
-    statuses = pricing.all_price_status(conn)
-    if not statuses:
-        st.info("Aucun ingrédient.")
+            "SELECT i.id, i.invoice_date, s.name AS supplier, i.invoice_number, i.total_ht FROM invoices i "
+            "JOIN suppliers s ON s.id = i.supplier_id ORDER BY i.invoice_date DESC LIMIT 10").fetchall()
+        if rows:
+            st.subheader("Dernières factures")
+            for r in rows:
+                with st.container(border=True):
+                    a, b, c = st.columns([2, 3, 2], vertical_alignment="center")
+                    a.write(date.fromisoformat(r["invoice_date"]).strftime("%d/%m/%Y"))
+                    b.write(f"**{r['supplier']}** · n° {r['invoice_number']}")
+                    c.write(eur(r["total_ht"]) + " HT" if r["total_ht"] else "")
         return
-    st.dataframe(pd.DataFrame([{
-        "Ingrédient": p.name, "Unité": p.base_unit,
-        "Prix de référence": p.reference, "Dernier prix": p.current,
-        "Variation": p.change * 100 if p.change is not None else None,
-        "Dernier achat": p.current_date, "Fournisseur": p.supplier,
-    } for p in statuses]), hide_index=True, width="stretch", column_config={
-        "Prix de référence": st.column_config.NumberColumn(format="%.2f €"),
-        "Dernier prix": st.column_config.NumberColumn(format="%.2f €"),
-        "Variation": st.column_config.NumberColumn(format="%+.1f %%"),
-    })
-    by_name = {p.name: p for p in statuses}
-    pick = st.selectbox("Historique des prix", list(by_name))
-    hist = pricing.price_history(conn, by_name[pick].ingredient_id)
-    if hist:
-        h = pd.DataFrame(hist)
-        h["date"] = pd.to_datetime(h["date"])
-        st.line_chart(h.groupby("date")["price"].mean(), y_label=f"€ HT / {by_name[pick].base_unit}")
-        st.dataframe(h.rename(columns={"date": "Date", "supplier": "Fournisseur", "label": "Libellé",
-                                       "price": "Prix / unité de base"}),
-                     hide_index=True, width="stretch",
-                     column_config={"Prix / unité de base": st.column_config.NumberColumn(format="%.3f €")})
+
+    # Vérification d'une facture lue
+    st.subheader("Vérifie la facture")
+    c1, c2, c3 = st.columns(3)
+    supplier = c1.text_input("Fournisseur", draft["supplier"])
+    number = c2.text_input("N° de facture", draft["invoice_number"])
+    try:
+        d0 = date.fromisoformat(draft["invoice_date"])
+    except ValueError:
+        d0 = date.today()
+    inv_date = c3.date_input("Date", d0, format="DD/MM/YYYY")
+    total = draft.get("total_ht") or 0.0
+
+    ings = ingredients(conn)
+    df = _prefill_lines(conn, supplier, draft["lines"])
+    a, b = st.columns([4, 1], vertical_alignment="bottom")
+    a.caption("✅ déjà connu · 🟡 à vérifier · 🔴 choisis le produit · ⚪ ignoré · ⚠ montant incohérent.  \n"
+              "« kg/L/pièces par unité » : ce que contient une unité facturée (colis 6 × 1 L → 6).")
+    with b:
+        _new_ingredient_form(conn, "inv")
+    edited = st.data_editor(
+        df, num_rows="dynamic", width="stretch", hide_index=True,
+        column_config={
+            "": st.column_config.TextColumn(disabled=True, width=40),
+            "Produit": st.column_config.SelectboxColumn(options=[IGNORE] + [i["name"] for i in ings], required=True),
+            "kg/L/pièces par unité": st.column_config.NumberColumn(min_value=0.0, format="%.3f"),
+            "Prix unitaire HT": st.column_config.NumberColumn(format="%.2f €"),
+        },
+        key=f"editor_{number}_{supplier}",
+    )
+    lines_sum = float((edited["Qté"].fillna(0) * edited["Prix unitaire HT"].fillna(0)).sum())
+    if total and abs(lines_sum - total) > max(1.0, 0.01 * total):
+        st.warning(f"Les lignes font {eur(lines_sum)} mais la facture indique {eur(total)} HT : "
+                   "une ligne manque ou est mal lue.")
+
+    b1, b2 = st.columns([1, 4])
+    if b2.button("Annuler"):
+        st.session_state.pop("draft", None)
+        st.rerun()
+    if b1.button("Valider", type="primary"):
+        errors = []
+        if not supplier.strip() or not number.strip():
+            errors.append("Indique le fournisseur et le numéro de facture.")
+        elif db.invoice_exists(conn, supplier, number):
+            errors.append("Cette facture est déjà enregistrée.")
+        id_by_name = {i["name"]: i["id"] for i in ings}
+        lines = []
+        for _, r in edited.iterrows():
+            if not str(r["Désignation"] or "").strip():
+                continue
+            ing_id = id_by_name.get(r["Produit"]) if r["Produit"] and r["Produit"] != IGNORE else None
+            bq = r["kg/L/pièces par unité"]
+            bq = float(bq) if pd.notna(bq) and bq else None
+            if ing_id and not bq:
+                errors.append(f"« {r['Désignation']} » : indique combien de kg/L/pièces contient une unité.")
+            q, pu = float(r["Qté"] or 0), float(r["Prix unitaire HT"] or 0)
+            lines.append({"label": r["Désignation"], "quantity": q, "unit": r["Unité"] or "",
+                          "unit_price_ht": pu, "line_total_ht": round(q * pu, 2),
+                          "ingredient_id": ing_id, "base_qty_per_unit": bq if ing_id else None})
+        if errors:
+            for e in errors:
+                st.error(e)
+            return
+        db.save_invoice(conn, supplier, number, inv_date.isoformat(), lines, total or None,
+                        draft.get("source_file", ""))
+        st.session_state.pop("draft", None)
+        touched = {l["ingredient_id"] for l in lines if l["ingredient_id"]}
+        st.session_state["flash"] = [a for a in pricing.price_alerts(conn) if a.ingredient_id in touched]
+        st.rerun()
 
 
-# --- Plats ---------------------------------------------------------------------
+def flash_after_invoice():
+    alerts = st.session_state.pop("flash", None)
+    if alerts is None:
+        return
+    st.success("Facture enregistrée.")
+    for a in alerts:
+        st.warning(f"**{a.name}** en hausse de {pct(a.change, sign=True)} ({eur(a.current)} / {a.base_unit}).")
 
-def page_dishes():
+
+# --- Ma carte ------------------------------------------------------------------
+
+def page_menu():
     conn = get_conn()
-    st.title("Plats et marges")
-    target = db.get_setting(conn, "target_food_cost")
+    st.title("Ma carte")
     reports = pricing.all_dish_reports(conn)
-    vat = {r["id"]: r["vat_rate"] for r in conn.execute("SELECT id, vat_rate FROM dishes")}
-    if reports:
-        st.dataframe(pd.DataFrame([{
-            "Plat": r.name, "Prix TTC": r.price_ttc, "Coût matière": r.cost_now,
-            "Ratio matière": r.food_cost_now * 100, "Marge": r.margin_rate_now * 100,
-            "Évolution (pts)": r.margin_drift_pts, "Impact / mois": r.monthly_impact,
-            "Prix TTC pour garder la marge en €": r.price_ttc_to_keep_margin_eur(vat[r.dish_id]),
-            "Prix TTC pour garder la marge en %": r.price_ttc_to_keep_margin(vat[r.dish_id]),
-            "Prix manquants": ", ".join(r.missing_prices),
-        } for r in sorted(reports, key=lambda r: r.monthly_impact)]),
-            hide_index=True, width="stretch", column_config={
-                "Prix TTC": st.column_config.NumberColumn(format="%.2f €"),
-                "Coût matière": st.column_config.NumberColumn(format="%.2f €"),
-                "Ratio matière": st.column_config.NumberColumn(format="%.1f %%"),
-                "Marge": st.column_config.NumberColumn(format="%.1f %%"),
-                "Évolution (pts)": st.column_config.NumberColumn(format="%+.1f"),
-                "Impact / mois": st.column_config.NumberColumn(format="%+.0f €"),
-                "Prix TTC pour garder la marge en €": st.column_config.NumberColumn(format="%.2f €"),
-                "Prix TTC pour garder la marge en %": st.column_config.NumberColumn(format="%.2f €"),
-            })
-        st.caption(f"Ratio matière cible : {pct(target, 0)}. « Évolution » compare au coût calculé avec "
-                   "les prix de référence. Impact = écart de coût × portions vendues par mois.")
+    target = db.get_setting(conn, "target_food_cost")
+    dishes = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM dishes")}
 
-    st.subheader("Créer ou modifier une fiche technique")
-    dishes = {r["name"]: dict(r) for r in conn.execute("SELECT * FROM dishes ORDER BY name")}
-    choice = st.selectbox("Plat", ["+ Nouveau plat"] + list(dishes))
-    cur = dishes.get(choice, {"id": None, "name": "", "price_ttc": 0.0, "vat_rate": 0.10, "monthly_volume": 0.0})
-    c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
-    name = c1.text_input("Nom du plat", cur["name"])
-    price = c2.number_input("Prix TTC", value=float(cur["price_ttc"]), min_value=0.0, step=0.5)
-    vat_rate = c3.selectbox("TVA", [0.10, 0.055, 0.20], index=[0.10, 0.055, 0.20].index(cur["vat_rate"])
-                            if cur["vat_rate"] in (0.10, 0.055, 0.20) else 0,
-                            format_func=lambda v: pct(v, 1 if v == 0.055 else 0))
-    volume = c4.number_input("Portions / mois", value=float(cur["monthly_volume"]), min_value=0.0, step=10.0)
+    if reports:
+        for r in sorted(reports, key=lambda r: r.margin_rate_now):
+            with st.container(border=True):
+                a, b, c, d = st.columns([3, 1, 2, 1], vertical_alignment="center")
+                a.markdown(f"**{r.name}**  \n<span class='muted'>{eur(r.price_ttc)} TTC · "
+                           f"{dishes[r.dish_id]['monthly_volume']:.0f} / mois</span>", unsafe_allow_html=True)
+                cls = "red" if r.food_cost_now > target else ""
+                b.markdown(f"<span class='{cls}'><b>{pct(r.margin_rate_now, 0)}</b></span>  \n"
+                           f"<span class='muted'>de marge</span>", unsafe_allow_html=True)
+                if r.margin_drift_pts < -0.05:
+                    c.markdown(f"<span class='red'>{r.margin_drift_pts:+.1f} pts</span>  \n".replace(".", ",")
+                               + "<span class='muted'>depuis 90 jours</span>", unsafe_allow_html=True)
+                if r.missing_prices:
+                    c.markdown(f"<span class='muted'>Prix manquant : {', '.join(r.missing_prices)}</span>",
+                               unsafe_allow_html=True)
+                if d.button("Modifier", key=f"edit_{r.dish_id}", width="stretch"):
+                    st.session_state["edit_dish"] = r.dish_id
+        st.caption(f"En rouge : plus de {pct(target, 0)} de coût matière (réglable dans Paramètres).")
+    else:
+        st.info("Aucun plat. Ajoute ta première fiche technique ci-dessous.")
+
+    if st.button("+ Ajouter un plat"):
+        st.session_state["edit_dish"] = None
+        st.session_state["new_dish"] = True
+    editing = st.session_state.get("edit_dish")
+    if editing is not None or st.session_state.get("new_dish"):
+        dish_editor(conn, dishes.get(editing))
+
+
+def dish_editor(conn, cur: dict | None):
+    cur = cur or {"id": None, "name": "", "price_ttc": 0.0, "vat_rate": 0.10, "monthly_volume": 0.0}
+    st.divider()
+    st.subheader(cur["name"] or "Nouveau plat")
+    c1, c2, c3 = st.columns([3, 1, 1])
+    name = c1.text_input("Nom", cur["name"])
+    price = c2.number_input("Prix TTC (€)", value=float(cur["price_ttc"]), min_value=0.0, step=0.5)
+    volume = c3.number_input("Vendus / mois", value=float(cur["monthly_volume"]), min_value=0.0, step=10.0)
 
     ings = ingredients(conn)
     unit_of = {i["name"]: i["base_unit"] for i in ings}
     items = []
     if cur["id"]:
         items = [dict(r) for r in conn.execute(
-            "SELECT i.name AS Ingrédient, di.quantity AS Quantité, di.yield_pct AS Rendement "
+            "SELECT i.name AS Produit, di.quantity AS Quantité, di.yield_pct AS Rendement "
             "FROM dish_items di JOIN ingredients i ON i.id = di.ingredient_id WHERE di.dish_id = ?", (cur["id"],))]
-    df = pd.DataFrame(items or [{"Ingrédient": None, "Quantité": 0.0, "Rendement": 1.0}])
-    df["Unité"] = df["Ingrédient"].map(unit_of)
-    st.caption("Quantité nette dans l'assiette, en unité de base de l'ingrédient (kg, L ou pièce). "
-               "Rendement : 0,8 si 20 % de perte (épluchage, parage, cuisson).")
-    edited = st.data_editor(df, num_rows="dynamic", hide_index=True, width="stretch",
-                            key=f"dish_{choice}", column_config={
-                                "Ingrédient": st.column_config.SelectboxColumn(options=list(unit_of), required=True),
+    df = pd.DataFrame(items or [{"Produit": None, "Quantité": 0.0, "Rendement": 1.0}])
+    df.insert(2, "Unité", df["Produit"].map(unit_of))
+    st.caption("Quantité dans l'assiette, en kg, L ou pièces (180 g → 0,18). "
+               "Rendement : 0,8 si 20 % de perte à l'épluchage ou à la cuisson.")
+    edited = st.data_editor(df, num_rows="dynamic", hide_index=True, width="stretch", key=f"dish_{cur['id']}",
+                            column_config={
+                                "Produit": st.column_config.SelectboxColumn(options=list(unit_of), required=True),
                                 "Quantité": st.column_config.NumberColumn(min_value=0.0, format="%.3f"),
+                                "Unité": st.column_config.TextColumn(disabled=True, width=60),
                                 "Rendement": st.column_config.NumberColumn(min_value=0.05, max_value=1.0, format="%.2f"),
-                                "Unité": st.column_config.TextColumn(disabled=True),
                             })
-    b1, b2 = st.columns([1, 5])
+    with st.expander("TVA"):
+        rates = [0.10, 0.055, 0.20]
+        vat_rate = st.radio("Taux", rates, index=rates.index(cur["vat_rate"]) if cur["vat_rate"] in rates else 0,
+                            format_func=lambda v: pct(v, 1 if v == 0.055 else 0), horizontal=True,
+                            label_visibility="collapsed")
+
+    b1, b2, b3 = st.columns([1, 1, 3])
     if b1.button("Enregistrer", type="primary"):
         if not name.strip() or price <= 0:
-            st.error("Nom et prix TTC obligatoires.")
-        else:
-            id_by_name = {i["name"]: i["id"] for i in ings}
-            with db.transaction(conn):
-                if cur["id"]:
-                    conn.execute("UPDATE dishes SET name=?, price_ttc=?, vat_rate=?, monthly_volume=? WHERE id=?",
-                                 (name.strip(), price, vat_rate, volume, cur["id"]))
-                    did = cur["id"]
-                    conn.execute("DELETE FROM dish_items WHERE dish_id = ?", (did,))
-                else:
-                    did = conn.execute("INSERT INTO dishes(name, price_ttc, vat_rate, monthly_volume) "
-                                       "VALUES (?, ?, ?, ?)", (name.strip(), price, vat_rate, volume)).lastrowid
-                for _, r in edited.iterrows():
-                    if r["Ingrédient"] in id_by_name and r["Quantité"] and r["Quantité"] > 0:
-                        conn.execute("INSERT INTO dish_items(dish_id, ingredient_id, quantity, yield_pct) "
-                                     "VALUES (?, ?, ?, ?)",
-                                     (did, id_by_name[r["Ingrédient"]], float(r["Quantité"]),
-                                      float(r["Rendement"] or 1.0)))
-            st.success("Fiche technique enregistrée.")
-            st.rerun()
-    if cur["id"] and b2.button("Supprimer ce plat"):
+            st.error("Indique un nom et un prix.")
+            return
+        id_by_name = {i["name"]: i["id"] for i in ings}
+        with db.transaction(conn):
+            if cur["id"]:
+                conn.execute("UPDATE dishes SET name=?, price_ttc=?, vat_rate=?, monthly_volume=? WHERE id=?",
+                             (name.strip(), price, vat_rate, volume, cur["id"]))
+                did = cur["id"]
+                conn.execute("DELETE FROM dish_items WHERE dish_id = ?", (did,))
+            else:
+                did = conn.execute("INSERT INTO dishes(name, price_ttc, vat_rate, monthly_volume) VALUES (?, ?, ?, ?)",
+                                   (name.strip(), price, vat_rate, volume)).lastrowid
+            for _, r in edited.iterrows():
+                if r["Produit"] in id_by_name and r["Quantité"] and r["Quantité"] > 0:
+                    conn.execute("INSERT INTO dish_items(dish_id, ingredient_id, quantity, yield_pct) VALUES (?, ?, ?, ?)",
+                                 (did, id_by_name[r["Produit"]], float(r["Quantité"]), float(r["Rendement"] or 1.0)))
+        st.session_state.pop("edit_dish", None)
+        st.session_state.pop("new_dish", None)
+        st.rerun()
+    if b2.button("Fermer"):
+        st.session_state.pop("edit_dish", None)
+        st.session_state.pop("new_dish", None)
+        st.rerun()
+    if cur["id"] and b3.button("Supprimer ce plat"):
         conn.execute("DELETE FROM dishes WHERE id = ?", (cur["id"],))
         conn.commit()
+        st.session_state.pop("edit_dish", None)
         st.rerun()
 
 
@@ -496,43 +476,49 @@ def page_settings():
     conn = get_conn()
     st.title("Paramètres")
     with st.form("settings"):
-        thr = st.slider("Seuil d'alerte de hausse (%)", 1, 30, int(db.get_setting(conn, "alert_threshold") * 100))
-        days = st.slider("Période de référence (jours)", 30, 365, int(db.get_setting(conn, "reference_days")))
-        tgt = st.slider("Ratio matière cible (%)", 15, 50, int(db.get_setting(conn, "target_food_cost") * 100))
+        thr = st.slider("Alerter à partir d'une hausse de", 1, 30,
+                        int(round(db.get_setting(conn, "alert_threshold") * 100)), format="%d %%")
+        days = st.slider("Comparer au prix moyen des derniers", 30, 365,
+                         int(db.get_setting(conn, "reference_days")), format="%d jours")
+        tgt = st.slider("Coût matière maximum par plat", 15, 50,
+                        int(round(db.get_setting(conn, "target_food_cost") * 100)), format="%d %%")
         if st.form_submit_button("Enregistrer"):
             db.set_setting(conn, "alert_threshold", thr / 100)
             db.set_setting(conn, "reference_days", days)
             db.set_setting(conn, "target_food_cost", tgt / 100)
-            st.success("Paramètres enregistrés.")
+            st.success("C'est enregistré.")
 
-    st.subheader("Lecture des factures")
-    st.write("Clé API Claude : " + ("détectée ✅" if api_key_available() else "absente ❌ (fichier `.env`)"))
-
-    st.subheader("Données")
+    st.subheader("Démo")
     c1, c2 = st.columns(2)
-    if c1.button("Charger la brasserie de démonstration"):
+    if c1.button("Charger la brasserie de démonstration", type="primary"):
         try:
             demo.load_demo(conn)
-            st.success("Démo chargée : 3 fournisseurs, 5 mois de factures, 5 plats.")
+            st.session_state.pop("produit", None)
+            st.switch_page(PAGES["accueil"])
         except RuntimeError as e:
             st.error(str(e))
-    confirm = c2.checkbox("Je veux tout effacer")
-    if c2.button("Vider la base", disabled=not confirm):
-        demo.reset(conn)
-        st.success("Base vidée.")
+    with c2.popover("Tout effacer"):
+        st.write("Supprime toutes les factures, produits et plats.")
+        if st.button("Oui, tout effacer"):
+            demo.reset(conn)
+            st.session_state.pop("produit", None)
+            st.rerun()
+    st.caption("Lecture automatique des factures : " + ("active ✅" if api_key_available() else "inactive (clé API absente)"))
 
 
 def main():
     load_env()
     st.set_page_config(page_title="Marge Resto", page_icon="🍽️", layout="wide")
-    nav = st.navigation([
-        st.Page(page_dashboard, title="Tableau de bord", url_path="tableau", default=True),
-        st.Page(page_impact, title="Impact des hausses", url_path="impact"),
-        st.Page(page_invoices, title="Factures", url_path="factures"),
-        st.Page(page_ingredients, title="Prix des ingrédients", url_path="prix"),
-        st.Page(page_dishes, title="Plats et marges", url_path="plats"),
-        st.Page(page_settings, title="Paramètres", url_path="parametres"),
-    ])
+    st.markdown(CSS, unsafe_allow_html=True)
+    PAGES.update({
+        "accueil": st.Page(page_home, title="Accueil", icon="🏠", url_path="accueil", default=True),
+        "produit": st.Page(page_product, title="Par produit", icon="🔎", url_path="produit"),
+        "factures": st.Page(page_invoices, title="Factures", icon="🧾", url_path="factures"),
+        "carte": st.Page(page_menu, title="Ma carte", icon="🍽️", url_path="carte"),
+        "parametres": st.Page(page_settings, title="Paramètres", icon="⚙️", url_path="parametres"),
+    })
+    nav = st.navigation(list(PAGES.values()))
+    flash_after_invoice()
     nav.run()
 
 
