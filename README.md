@@ -31,7 +31,8 @@ Copie `.env.example` en `.env` et colle ta clé API Anthropic (console.anthropic
 | 3. Prix | Par produit (historique) | Prix ramené au kg, au litre ou à la pièce. Prix de référence = moyenne des achats des 90 jours précédents. |
 | 4. Fiches techniques | Ma carte | Grammages nets, rendement, prix TTC, portions vendues par mois. |
 | 5. Impact | Par produit | Pour chaque matière première : marge perdue par mois sur tous les plats qui l'utilisent, part de la marge globale, simulation d'une hausse (ex. +10 % sur le bœuf). |
-| 6. Alertes | Accueil | Hausses au-dessus du seuil (5 % par défaut), plats dont la marge recule, € perdus par mois, prix conseillé. |
+| 6. Comparateur | Fournisseurs | Pour chaque produit, dernier prix connu chez chaque fournisseur (factures + devis saisis), économie mensuelle si on change, d'après les quantités réellement achetées. Un prix de plus de 2 mois est signalé « à redemander » et n'entre pas dans l'économie. |
+| 7. Alertes | Accueil | Hausses au-dessus du seuil (5 % par défaut), plats dont la marge recule, € perdus par mois, prix conseillé. |
 
 ## Structure
 
@@ -41,6 +42,7 @@ margeresto/db.py           base SQLite (data/marge.db) et enregistrement des fac
 margeresto/extraction.py   lecture des factures via l'API Claude
 margeresto/matching.py     rapprochement libellé → ingrédient, lecture des conditionnements (10X250G…)
 margeresto/pricing.py      prix de référence, alertes, coût et marge par plat
+margeresto/suppliers.py    comparateur de fournisseurs
 margeresto/demo.py         brasserie de démonstration (3 fournisseurs, 5 mois, 5 plats)
 tests/test_core.py         tests (python3 -m pytest)
 ```

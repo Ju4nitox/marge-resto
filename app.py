@@ -11,7 +11,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from margeresto import db, demo, pricing
+from margeresto import db, demo, pricing, suppliers
 from margeresto.extraction import ExtractionError, api_key_available, extract_invoice
 from margeresto.matching import base_qty_from_unit, suggest_ingredient
 
@@ -137,6 +137,15 @@ def page_home():
                            f"  \n<span class='muted'>pour garder la même marge par assiette</span>",
                            unsafe_allow_html=True)
 
+    saving = sum(c.monthly_saving for c in suppliers.compare_all(conn))
+    if saving > 0.5:
+        with st.container(border=True):
+            a, b = st.columns([5, 1], vertical_alignment="center")
+            a.markdown(f"💡 En changeant de fournisseur sur certains produits, tu économiserais "
+                       f"**{eur(saving, 0)} par mois**.")
+            if b.button("Comparer", width="stretch"):
+                st.switch_page(PAGES["fournisseurs"])
+
     st.caption(f"Marge brute mensuelle de la carte : {eur(total_margin, 0)}. "
                "Calculs à volumes de vente constants, par rapport aux prix des 90 derniers jours.")
 
@@ -201,12 +210,111 @@ def page_product():
             else:
                 c.markdown("<span class='muted'>Rien à changer</span>", unsafe_allow_html=True)
 
+    cmp_ = suppliers.compare_ingredient(conn, pick)
+    st.subheader("Chez tes fournisseurs")
+    if cmp_:
+        for o in cmp_.offers:
+            best = o is cmp_.best and cmp_.has_alternative
+            st.markdown(("🏆 " if best else "• ") + _offer_line(o, unit, cmp_, current=o.supplier == cmp_.current.supplier)
+                        + (" · <span class='muted'>fournisseur actuel</span>" if o.supplier == cmp_.current.supplier else ""),
+                        unsafe_allow_html=True)
+        if cmp_.monthly_saving > 0.5:
+            st.success(f"Passer chez {cmp_.best.supplier} : {eur(cmp_.monthly_saving, 0)} d'économie par mois.")
+    with st.popover("+ Ajouter le prix d'un autre fournisseur"):
+        quote_form(conn, key="prod", ingredient_id=pick)
+
     hist = pricing.price_history(conn, pick)
     if len(hist) > 1:
         with st.expander("Historique du prix"):
             h = pd.DataFrame(hist)
             h["date"] = pd.to_datetime(h["date"])
             st.line_chart(h.groupby("date")["price"].mean(), y_label=f"€ HT / {unit}", height=220)
+
+
+# --- Fournisseurs --------------------------------------------------------------
+
+def _offer_line(o, unit: str, cmp_, current: bool = False) -> str:
+    when = date.fromisoformat(o.date).strftime("%d/%m")
+    tag = f"{'facture' if o.source == 'facture' else 'devis'} du {when}"
+    stale = " · <span class='red'>à confirmer</span>" if cmp_.is_stale(o) and not current else ""
+    return f"**{o.supplier}** · {eur(o.price)}/{unit} <span class='muted'>({tag})</span>{stale}"
+
+
+def page_suppliers():
+    conn = get_conn()
+    st.title("Comparateur de fournisseurs")
+    comps = suppliers.compare_all(conn)
+    if not comps:
+        empty_state()
+        return
+    deals = [c for c in comps if c.monthly_saving > 0.5]
+    total = sum(c.monthly_saving for c in deals)
+    if deals:
+        st.markdown(f"<div class='lead'>En changeant de fournisseur sur {len(deals)} produit"
+                    f"{'s' if len(deals) > 1 else ''}, tu économiserais "
+                    f"<span class='big green'>{eur(total, 0)}</span> par mois</div>", unsafe_allow_html=True)
+    else:
+        st.success("Tu achètes déjà chaque produit au meilleur prix connu.")
+
+    for c in deals:
+        u = c.base_unit
+        with st.container(border=True):
+            a, b = st.columns([4, 2], vertical_alignment="center")
+            a.markdown(f"#### {c.name}")
+            a.markdown("Aujourd'hui : " + _offer_line(c.current, u, c, current=True), unsafe_allow_html=True)
+            a.markdown(f"Moins cher ({pct(c.best.price / c.current.price - 1, sign=True)}) : "
+                       + _offer_line(c.best, u, c), unsafe_allow_html=True)
+            b.markdown(f"<span class='big green'>{eur(c.monthly_saving, 0)}</span><br>"
+                       f"<span class='muted'>par mois · {qty(c.monthly_qty, u)} achetés / mois</span>",
+                       unsafe_allow_html=True)
+            b.button("Voir le produit", key=f"cmp_{c.ingredient_id}", on_click=go_product,
+                     args=(c.ingredient_id,))
+
+    to_check = [c for c in comps if c.stale_cheaper]
+    if to_check:
+        st.markdown("**À redemander** — prix moins chers mais vieux de plus de 2 mois :")
+        for c in to_check:
+            o = c.stale_cheaper[0]
+            st.markdown(f"• {c.name} : " + _offer_line(o, c.base_unit, c)
+                        + f" vs {eur(c.current.price)} aujourd'hui", unsafe_allow_html=True)
+
+    single = [c.name for c in comps if not c.has_alternative]
+    if single:
+        st.caption(f"Pas encore comparés (un seul fournisseur connu) : {', '.join(single)}. "
+                   "Ajoute un devis ci-dessous pour les comparer.")
+
+    st.subheader("Ajouter un prix d'un autre fournisseur")
+    quote_form(conn, key="sup")
+
+
+def quote_form(conn, key: str, ingredient_id: int | None = None):
+    ings = ingredients(conn)
+    if not ings:
+        return
+    by_id = {i["id"]: i for i in ings}
+    known = [r["name"] for r in conn.execute("SELECT name FROM suppliers ORDER BY name")]
+    with st.form(f"quote_{key}", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        ids = [i["id"] for i in ings]
+        ing = c1.selectbox("Produit", ids, index=ids.index(ingredient_id) if ingredient_id in ids else 0,
+                           format_func=lambda i: by_id[i]["name"], disabled=ingredient_id is not None)
+        sup = c2.text_input("Fournisseur", placeholder=", ".join(known[:3]) if known else "ex. Promocash")
+        c3, c4, c5 = st.columns([1, 1, 2])
+        price = c3.number_input(f"Prix HT par {by_id[ing]['base_unit']}", min_value=0.0, step=0.1, format="%.2f")
+        when = c4.date_input("Date", date.today(), format="DD/MM/YYYY")
+        note = c5.text_input("Note (optionnel)", placeholder="devis, catalogue, franco…")
+        sure = st.checkbox("Je confirme ce prix même s'il est très éloigné de mon prix actuel")
+        if st.form_submit_button("Ajouter ce prix"):
+            target = ingredient_id or ing
+            cur = pricing.price_status(conn, target).current
+            if not sup.strip() or price <= 0:
+                st.error("Indique le fournisseur et un prix.")
+            elif cur and not (0.5 <= price / cur <= 2) and not sure:
+                st.error(f"Ce prix est très loin de ton prix actuel ({eur(cur)}/{by_id[target]['base_unit']}). "
+                         f"Vérifie que c'est bien un prix par {by_id[target]['base_unit']}, puis coche la case.")
+            else:
+                db.add_quote(conn, target, sup, price, when.isoformat(), note)
+                st.rerun()
 
 
 # --- Factures -----------------------------------------------------------------
@@ -513,6 +621,7 @@ def main():
     PAGES.update({
         "accueil": st.Page(page_home, title="Accueil", icon="🏠", url_path="accueil", default=True),
         "produit": st.Page(page_product, title="Par produit", icon="🔎", url_path="produit"),
+        "fournisseurs": st.Page(page_suppliers, title="Fournisseurs", icon="🏷️", url_path="fournisseurs"),
         "factures": st.Page(page_invoices, title="Factures", icon="🧾", url_path="factures"),
         "carte": st.Page(page_menu, title="Ma carte", icon="🍽️", url_path="carte"),
         "parametres": st.Page(page_settings, title="Paramètres", icon="⚙️", url_path="parametres"),

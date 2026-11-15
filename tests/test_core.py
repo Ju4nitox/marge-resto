@@ -44,11 +44,12 @@ def test_price_status_reference_window(conn):
     beurre = conn.execute("SELECT id FROM ingredients WHERE name = 'Beurre doux'").fetchone()[0]
     st = pricing.price_status(conn, beurre, reference_days=90)
     assert st.current == pytest.approx(10.40)
-    # fenêtre de 90 jours avant le 4 nov. = à partir du 6 août : achats de sept. et oct.
-    assert st.reference == pytest.approx((9.40 + 9.90) / 2)
-    # fenêtre de 120 jours : août entre aussi
+    # fenêtre de 90 jours avant le 4 nov. = à partir du 6 août :
+    # Metro 2/09 et 2/10, Pomona 18/09 et 20/10
+    assert st.reference == pytest.approx((9.40 + 9.45 + 9.90 + 9.70) / 4)
+    # fenêtre de 120 jours : l'achat Metro du 4 août entre aussi
     st120 = pricing.price_status(conn, beurre, reference_days=120)
-    assert st120.reference == pytest.approx((9.00 + 9.40 + 9.90) / 3)
+    assert st120.reference == pytest.approx((9.00 + 9.40 + 9.45 + 9.90 + 9.70) / 5)
 
 
 def test_alerts_sorted_and_thresholded(conn):
@@ -99,7 +100,7 @@ def test_ingredient_impact_observed(conn):
     imp = pricing.ingredient_impact(conn, beurre)
     names = {d.dish for d in imp["dishes"]}
     assert names == {"Entrecôte frites", "Pavé de saumon, crème citronnée", "Omelette, salade et frites"}
-    delta = 10.40 - (9.40 + 9.90) / 2
+    delta = 10.40 - (9.40 + 9.45 + 9.90 + 9.70) / 4
     entrecote = next(d for d in imp["dishes"] if d.dish == "Entrecôte frites")
     assert entrecote.extra_per_portion == pytest.approx(0.02 * delta)
     assert entrecote.monthly_impact == pytest.approx(-0.02 * delta * 400)
@@ -122,3 +123,52 @@ def test_impact_ranking_sums_to_dish_drift(conn):
     total = sum(r["monthly_impact"] for r in ranking)
     assert total == pytest.approx(sum(r.monthly_impact for r in pricing.all_dish_reports(conn)))
     assert ranking[0]["monthly_impact"] <= ranking[-1]["monthly_impact"]
+
+
+# --- Comparateur fournisseurs ---------------------------------------------------
+
+from margeresto import suppliers
+
+
+def _ing(conn, name):
+    return conn.execute("SELECT id FROM ingredients WHERE name = ?", (name,)).fetchone()[0]
+
+
+def test_compare_finds_cheaper_supplier_from_invoice(conn):
+    c = suppliers.compare_ingredient(conn, _ing(conn, "Bœuf haché 15 %"))
+    assert c.current.supplier == "Boucherie Martin" and c.current.price == pytest.approx(13.20)
+    assert c.best.supplier == "Metro" and c.best.price == pytest.approx(12.30)
+    # 3 livraisons de 160 kg + 20 kg chez Metro sur 90 jours -> 500 / 3 kg par mois
+    assert c.monthly_qty == pytest.approx(500 / 3)
+    assert c.monthly_saving == pytest.approx((13.20 - 12.30) * 500 / 3)
+    assert not c.is_stale(c.best)
+
+
+def test_compare_uses_recent_quotes(conn):
+    c = suppliers.compare_ingredient(conn, _ing(conn, "Saumon (pavé)"))
+    assert c.best.source == "devis" and c.best.supplier == "Marée de Rungis"
+    assert c.monthly_saving > 0
+
+
+def test_old_quote_not_counted_as_saving(conn):
+    c = suppliers.compare_ingredient(conn, _ing(conn, "Entrecôte"))
+    # devis Metro d'août à 30,20 € : moins cher, mais trop ancien pour être promis
+    assert c.best.supplier == "Boucherie Martin" and c.monthly_saving == 0
+    assert [o.supplier for o in c.stale_cheaper] == ["Metro"]
+
+
+def test_compare_no_saving_when_already_cheapest(conn):
+    c = suppliers.compare_ingredient(conn, _ing(conn, "Crème liquide 35 %"))
+    assert c.has_alternative and c.best.supplier == c.current.supplier
+    assert c.monthly_saving == 0
+
+
+def test_add_quote_rejects_bad_price(conn):
+    with pytest.raises(ValueError):
+        db.add_quote(conn, _ing(conn, "Sucre"), "Promocash", 0, "2026-11-10")
+
+
+def test_compare_all_sorted(conn):
+    res = suppliers.compare_all(conn)
+    savings = [c.monthly_saving for c in res]
+    assert savings == sorted(savings, reverse=True) and savings[0] > 0

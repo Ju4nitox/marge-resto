@@ -76,6 +76,16 @@ CREATE TABLE IF NOT EXISTS dish_items (
     yield_pct REAL NOT NULL DEFAULT 1.0
 );
 
+-- Prix proposé par un fournisseur hors facture (devis, catalogue, mercuriale), par unité de base.
+CREATE TABLE IF NOT EXISTS supplier_quotes (
+    id INTEGER PRIMARY KEY,
+    ingredient_id INTEGER NOT NULL REFERENCES ingredients(id) ON DELETE CASCADE,
+    supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
+    price REAL NOT NULL,
+    quote_date TEXT NOT NULL,
+    note TEXT DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -199,6 +209,18 @@ def save_invoice(conn, supplier_name: str, invoice_number: str, invoice_date: st
                     (sid, label_key(ln["label"]), ing, bq),
                 )
     return inv_id
+
+
+def add_quote(conn, ingredient_id: int, supplier_name: str, price: float, quote_date: str,
+              note: str = "") -> int:
+    """Enregistre un prix fournisseur hors facture (devis, catalogue), par unité de base."""
+    if price <= 0:
+        raise ValueError("Le prix doit être positif.")
+    with transaction(conn):
+        sid = get_or_create_supplier(conn, supplier_name)
+        return conn.execute(
+            "INSERT INTO supplier_quotes(ingredient_id, supplier_id, price, quote_date, note) "
+            "VALUES (?, ?, ?, ?, ?)", (ingredient_id, sid, price, quote_date, note)).lastrowid
 
 
 def known_mapping(conn, supplier_name: str, label: str):

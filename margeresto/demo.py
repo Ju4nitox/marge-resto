@@ -1,7 +1,7 @@
 """Données de démonstration : une brasserie, 5 mois de factures, 5 plats."""
 from __future__ import annotations
 
-from .db import get_or_create_ingredient, save_invoice
+from .db import add_quote, get_or_create_ingredient, save_invoice
 
 MONTHS = ["2026-07-03", "2026-08-04", "2026-09-02", "2026-10-02", "2026-11-04"]
 
@@ -36,6 +36,22 @@ CATALOG = [
      [9.50, 9.40, 9.20, 9.10, 9.00]),
     ("Tomate grappe", "kg", "Pomona", "TOMATE GRAPPE CAT1 5KG", "COLIS", 5, 8,
      [2.80, 2.70, 2.90, 3.20, 3.40]),
+]
+
+# Achats ponctuels chez un autre fournisseur, pour alimenter le comparateur :
+# date, fournisseur, ingrédient, libellé, unité, qté de base par unité, qté, prix HT par unité de base
+ALT_PURCHASES = [
+    ("2026-09-18", "Pomona", "Beurre doux", "BEURRE PLAQUE 82% MG 1KG", "PCE", 1, 6, 9.45),
+    ("2026-10-20", "Pomona", "Beurre doux", "BEURRE PLAQUE 82% MG 1KG", "PCE", 1, 6, 9.70),
+    ("2026-10-20", "Pomona", "Œufs", "OEUFS PLEIN AIR CAL M X90", "PLATEAU", 90, 4, 0.25),
+    ("2026-10-14", "Metro", "Crème liquide 35 %", "CREME LIQUIDE 35% 1L", "PCE", 1, 6, 4.85),
+    ("2026-10-14", "Metro", "Bœuf haché 15 %", "VIANDE HACHEE 15% MG 5KG", "COLIS", 5, 4, 12.30),
+]
+
+# Devis / catalogues reçus : date, fournisseur, ingrédient, prix HT par unité de base, note
+QUOTES = [
+    ("2026-11-02", "Marée de Rungis", "Saumon (pavé)", 23.40, "Devis par e-mail, franco 300 €"),
+    ("2026-08-10", "Metro", "Entrecôte", 30.20, "Prix catalogue"),
 ]
 
 # plat, prix TTC, TVA, volume mensuel, [(ingrédient, quantité nette, rendement)]
@@ -87,6 +103,18 @@ def load_demo(conn) -> None:
             save_invoice(conn, sup, f"F{day[:7].replace('-', '')}-{k + 1:02d}", day, lines, total,
                          source_file="démo")
 
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for day, sup, ing, label, unit, bq, qty, price in ALT_PURCHASES:
+        pu = round(price * bq, 2)
+        groups.setdefault((day, sup), []).append({
+            "label": label, "quantity": qty, "unit": unit, "unit_price_ht": pu,
+            "line_total_ht": round(qty * pu, 2), "ingredient_id": ing_ids[ing], "base_qty_per_unit": bq})
+    for k, ((day, sup), lines) in enumerate(sorted(groups.items())):
+        save_invoice(conn, sup, f"P{day.replace('-', '')}-{k + 1:02d}", day, lines,
+                     round(sum(l["line_total_ht"] for l in lines), 2), source_file="démo")
+    for day, sup, ing, price, note in QUOTES:
+        add_quote(conn, ing_ids[ing], sup, price, day, note)
+
     for name, ttc, vat, vol, items in DISHES:
         did = conn.execute(
             "INSERT INTO dishes(name, price_ttc, vat_rate, monthly_volume) VALUES (?, ?, ?, ?)",
@@ -98,7 +126,7 @@ def load_demo(conn) -> None:
 
 
 def reset(conn) -> None:
-    for t in ("dish_items", "dishes", "product_mappings", "invoice_lines", "invoices",
+    for t in ("dish_items", "dishes", "product_mappings", "supplier_quotes", "invoice_lines", "invoices",
               "suppliers", "ingredients"):
         conn.execute(f"DELETE FROM {t}")
     conn.commit()
